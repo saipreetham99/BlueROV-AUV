@@ -157,6 +157,7 @@ class VideoReceiver(threading.Thread):
         self.lock = threading.Lock()
         self.latest = None
         self.last_time = 0.0
+        self.tag_ids = []
         self.rec = Recorder()
 
         self.tag_det = None
@@ -210,6 +211,7 @@ class VideoReceiver(threading.Thread):
                     continue
                 raw = frame.copy()
 
+                ids = []
                 if self.tag_det is not None:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     for tag in self.tag_det.detect(gray):
@@ -224,6 +226,16 @@ class VideoReceiver(threading.Thread):
                             )
                         cx, cy = map(int, tag.center)
                         cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+                        cv2.putText(
+                            frame,
+                            f"id {tag.tag_id}",
+                            (cx + 8, cy - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 255, 0),
+                            2,
+                        )
+                        ids.append(int(tag.tag_id))
 
                 if self.yolo is not None and rf % self.yolo_interval == 0:
                     res = self.yolo(frame, conf=self.conf, max_det=1, verbose=False)[0]
@@ -236,6 +248,7 @@ class VideoReceiver(threading.Thread):
                 with self.lock:
                     self.latest = frame
                     self.last_time = time.time()
+                    self.tag_ids = ids
 
             now = time.time()
             for k in [k for k, v in buffers.items() if now - v["ts"] > 0.5]:
@@ -252,6 +265,10 @@ class VideoReceiver(threading.Thread):
 
     def toggle_record(self):
         self.rec.toggle()
+
+    def get_tag_ids(self):
+        with self.lock:
+            return list(self.tag_ids)
 
 
 # ---------- pygame UI ----------
@@ -560,6 +577,16 @@ class App:
                 self.f_small.render("● REC", True, (255, 80, 80)),
                 (self.vid_rect.x + 8, self.vid_rect.y + 8),
             )
+
+        # AprilTag readout
+        ids = self.video.get_tag_ids()
+        tag_txt = "AprilTag IDs: " + (", ".join(str(i) for i in ids) if ids else "none")
+        s.blit(
+            self.f_status.render(
+                tag_txt, True, (120, 230, 120) if ids else (150, 150, 150)
+            ),
+            (565, 496),
+        )
 
         pygame.display.flip()
 
