@@ -37,6 +37,7 @@ import pygame
 
 NEUTRAL = 1500
 LIGHT_OFF = 1100
+LIGHT_ON = 1900
 SENSOR_FMT = "<dff"  # (epoch_time, depth_m, yaw_deg) - matches rov_server.py
 
 
@@ -61,7 +62,7 @@ def to_pwm(x, amp):
     return int(NEUTRAL + x * amp)
 
 
-def thruster_packet(thr, amp):
+def thruster_packet(thr, amp, light=LIGHT_OFF):
     fl, fr, rl, rr, v1, v2 = thr
     return struct.pack(
         "<7H",
@@ -71,12 +72,12 @@ def thruster_packet(thr, amp):
         to_pwm(rr, amp),
         to_pwm(v1, amp),
         to_pwm(v2, amp),
-        LIGHT_OFF,
+        light,
     )
 
 
-def neutral_packet():
-    return struct.pack("<7H", *([NEUTRAL] * 6), LIGHT_OFF)
+def neutral_packet(light=LIGHT_OFF):
+    return struct.pack("<7H", *([NEUTRAL] * 6), light)
 
 
 def load_config(mode):
@@ -464,6 +465,9 @@ class App:
         self.amp = 100
         self.capture = False
         self.rate = 50.0
+        # light state
+        self.light_on = False  # manual LIGHT toggle
+        self.tag_flash = False  # flash lights while an AprilTag is in view
         self.countdown = 3
         self.running = False
         self.abort = False
@@ -560,9 +564,46 @@ class App:
             )
         )
 
+        # light + apriltag-flash toggles (green while active)
+        self.buttons.append(
+            Button(
+                (560, 486, 130, 44),
+                lambda: "LIGHT: ON" if self.light_on else "LIGHT: OFF",
+                self.toggle_light,
+                (150, 130, 40),
+                lambda: True,
+            )
+        )
+        self.buttons.append(
+            Button(
+                (700, 486, 150, 44),
+                lambda: "TAG FLASH: ON" if self.tag_flash else "TAG FLASH: OFF",
+                self.toggle_tag_flash,
+                (120, 90, 140),
+                lambda: True,
+            )
+        )
+
     # settings
     def toggle_capture(self):
         self.capture = not self.capture
+
+    def toggle_light(self):
+        self.light_on = not self.light_on
+
+    def toggle_tag_flash(self):
+        self.tag_flash = not self.tag_flash
+
+    def current_light(self):
+        """PWM to put in the packet's light channel right now.
+
+        If TAG FLASH is on and a tag is currently detected, blink the lights
+        (overriding the manual LIGHT state). Otherwise use the manual toggle.
+        """
+        if self.tag_flash and self.video.get_tag_ids():
+            # ~4 Hz blink: on/off every 0.25 s
+            return LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF
+        return LIGHT_ON if self.light_on else LIGHT_OFF
 
     def set_dur(self, d):
         self.duration = max(1, min(15, self.duration + d))
@@ -590,14 +631,13 @@ class App:
     def stop(self):
         self.abort = True
         for _ in range(5):
-            self.sock.sendto(neutral_packet(), self.thr_addr)
+            self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
         self.set_status("STOP - neutral sent")
 
     def _worker(self, motion, sign):
         cmd = {"surge": 0.0, "strafe": 0.0, "heave": 0.0, "yaw": 0.0}
         cmd[motion] = float(sign)
         thr = mix(cmd["surge"], cmd["strafe"], cmd["heave"], cmd["yaw"])
-        packet = thruster_packet(thr, self.amp)
         label = f"{motion} {'+' if sign > 0 else '-'}"
         self.add_log(f"{label}  amp={self.amp}  {self.duration}s")
 
@@ -607,7 +647,7 @@ class App:
             self.sensors.start_record(fname)
             self.add_log(f"recording -> {fname}")
 
-        self.sock.sendto(neutral_packet(), self.thr_addr)
+        self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
         dt = 1.0 / self.rate
 
         for i in range(self.countdown, 0, -1):
@@ -623,7 +663,10 @@ class App:
             t_next = time.time()
             t_end = t_next + self.duration
             while time.time() < t_end and not self.abort:
-                self.sock.sendto(packet, self.thr_addr)
+                # rebuild each send so LIGHT / TAG FLASH stay live during the test
+                self.sock.sendto(
+                    thruster_packet(thr, self.amp, self.current_light()), self.thr_addr
+                )
                 t_next += dt
                 d = t_next - time.time()
                 if d > 0:
@@ -633,7 +676,7 @@ class App:
             self.set_status("ABORTED" if self.abort else ">>> STOP - settling...")
 
         for _ in range(int(0.5 / dt) + 1):
-            self.sock.sendto(neutral_packet(), self.thr_addr)
+            self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
             time.sleep(dt)
 
         # let the sub finish gliding, then read the net sensor change
@@ -657,6 +700,7 @@ class App:
     # main loop
     def run(self):
         clock = pygame.time.Clock()
+        last_keepalive = 0.0
         while True:
             for e in pygame.event.get():
                 if e.type == pygame.QUIT:
@@ -666,6 +710,18 @@ class App:
                     for b in self.buttons:
                         if b.click(e.pos):
                             break
+            # idle keep-alive: when NOT running a test, send neutral packets
+            # carrying the current light value. Keeps LIGHT / TAG FLASH live and
+            # satisfies the server's 0.5s watchdog. ~20 Hz is plenty.
+            now = time.time()
+            if not self.running and now - last_keepalive >= 0.05:
+                try:
+                    self.sock.sendto(
+                        neutral_packet(self.current_light()), self.thr_addr
+                    )
+                except Exception:
+                    pass
+                last_keepalive = now
             self.draw()
             clock.tick(30)
 
