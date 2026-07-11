@@ -1,0 +1,19 @@
+
+# Topside client (rov-client.py) — runs on your laptop/desktop (macOS/Linux).
+# Install:  pip install -r requirements-client.txt
+#
+# Python 3.10+ recommended.
+
+# --- Core (required for thrusters + video panel) ---
+opencv-python>=4.8
+numpy>=1.24
+pygame>=2.6
+
+# --- Optional: AprilTag overlay ---
+# Without this, the client runs fine; tag detection is just disabled.
+pupil-apriltags>=1.0.4
+
+# --- Optional: YOLO object detection (--weights) ---
+# Pulls in torch (large). Only needed if you pass --weights.
+# Runs in its own process, so it won't conflict with pygame/cv2.
+ultralytics>=8.0

@@ -1,0 +1,23 @@
+# Sub-side server (rov-server.py) — runs on the Raspberry Pi.
+# Install:  pip install -r requirements-server.txt
+#
+# Python 3.9+ (matches the Pi's system Python).
+
+# --- pip-installable ---
+opencv-python>=4.8      # video capture + JPEG encode
+smbus2>=0.4             # I2C (depth sensor MS5837, magnetometer)
+spidev>=3.5             # SPI (ICM20602 IMU)
+RPi.GPIO>=0.7           # PCA9685 driver uses GPIO
+
+# --- NOT on PyPI: your local hardware driver files ---
+# These are NOT `pip install`-able. They're the driver modules you already
+# have on the Pi and import directly. Make sure each is importable (on
+# PYTHONPATH or copied next to rov-server.py):
+#
+#   pca9685    -> your ~/drivers/pca9685-python/pca9685  (thruster PWM)
+#   icm20602   -> your icm20602.py driver               (gyro yaw)
+#   ms5837     -> BlueRobotics ms5837-python (git clone) (depth)
+#                 https://github.com/bluerobotics/ms5837-python
+#
+# Nothing to install for these — just confirm `python -c "import pca9685, icm20602, ms5837"`
+# succeeds on the Pi before running the server.
