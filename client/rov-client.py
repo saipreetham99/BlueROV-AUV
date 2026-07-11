@@ -61,69 +61,6 @@ def to_pwm(x, amp):
     return int(NEUTRAL + x * amp)
 
 
-#!/usr/bin/env python3
-"""
-Combined topside ROV client (single pygame window):
-
-  * Thruster test panel (always runs, even with no video): pick a motion, it drives one
-    DOF at a fixed level for a fixed duration through the SAME mix/packet as the driver,
-    then neutral. STOP aborts. Same engine as pool_test.py / real_test_gui.py.
-  * Live video (shown inside the window when the stream is up; "NO VIDEO" otherwise),
-    with AprilTag (optional) and YOLO (optional, --weights) overlays and a RECORD button
-    that saves the clean stream to mp4.
-
-Mode (lan/wifi) is chosen at launch with --wifi and applies to both video and thrusters.
-Reads .rov_server_creds.
-
-  python rov_client.py
-  python rov_client.py --wifi --weights best.pt
-"""
-
-import argparse
-import configparser
-import os
-
-# cv2 and pygame both ship SDL2; allow the duplicate class registration quietly.
-os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
-
-import socket
-import struct
-import sys
-import threading
-import time
-from collections import defaultdict
-from datetime import datetime
-
-import cv2
-import numpy as np
-import pygame
-
-NEUTRAL = 1500
-LIGHT_OFF = 1100
-SENSOR_FMT = "<dff"  # (epoch_time, depth_m, yaw_deg) - matches rov_server.py
-
-
-# ---------- shared thruster core (identical to pool_test.py) ----------
-
-
-def clamp(x):
-    return max(-1.0, min(1.0, x))
-
-
-def mix(surge, strafe, heave, yaw):
-    fl = clamp(surge - strafe - yaw)
-    fr = clamp(surge + strafe + yaw)
-    rl = clamp(surge + strafe - yaw)
-    rr = clamp(surge - strafe + yaw)
-    v1 = clamp(heave)
-    v2 = clamp(-heave)
-    return fl, fr, rl, rr, v1, v2
-
-
-def to_pwm(x, amp):
-    return int(NEUTRAL + x * amp)
-
-
 def thruster_packet(thr, amp):
     fl, fr, rl, rr, v1, v2 = thr
     return struct.pack(
@@ -252,6 +189,53 @@ class Recorder:
             self.writer = None
 
 
+import multiprocessing as mp
+
+
+def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
+    """Runs in a SEPARATE process with a clean interpreter.
+
+    Imports torch/ultralytics here only — never in the pygame+cv2 process,
+    which avoids the native-library (SDL/cv2/torch) collision that segfaults
+    when they share one process. Receives BGR frames on in_q, returns
+    detection boxes on out_q as a list of (x1, y1, x2, y2) ints.
+    """
+    try:
+        from ultralytics import YOLO
+
+        model = YOLO(weights)
+    except Exception as e:
+        # Report and exit; parent keeps running with video-only.
+        try:
+            out_q.put(("__error__", str(e)))
+        except Exception:
+            pass
+        return
+
+    while not stop_ev.is_set():
+        try:
+            frame = in_q.get(timeout=0.5)
+        except Exception:
+            continue
+        if frame is None:
+            break
+        try:
+            res = model(frame, conf=conf, max_det=1, verbose=False)[0]
+            boxes = [tuple(map(int, b.xyxy[0])) for b in res.boxes]
+        except Exception:
+            boxes = []
+        # Keep only the freshest result: clear any stale box list first.
+        try:
+            while not out_q.empty():
+                out_q.get_nowait()
+        except Exception:
+            pass
+        try:
+            out_q.put(boxes)
+        except Exception:
+            pass
+
+
 class VideoReceiver(threading.Thread):
     def __init__(self, server_ip, port, weights=None, conf=0.5, yolo_interval=3):
         super().__init__(daemon=True)
@@ -275,12 +259,26 @@ class VideoReceiver(threading.Thread):
         except ImportError:
             print("[tags] pupil_apriltags not installed - tag overlay off")
 
-        self.yolo = None
+        # YOLO runs in a separate process (see _yolo_worker). Torch is never
+        # imported in this process, so it can't collide with pygame/cv2/SDL.
+        self.yolo_on = bool(weights)
+        self.yolo_proc = None
+        self.yolo_in = None
+        self.yolo_out = None
+        self.yolo_stop = None
+        self.last_boxes = []
         if weights:
-            from ultralytics import YOLO
-
-            self.yolo = YOLO(weights)
-            print(f"[yolo] loaded {weights}")
+            ctx = mp.get_context("spawn")  # fresh interpreter, NOT fork
+            self.yolo_in = ctx.Queue(maxsize=1)
+            self.yolo_out = ctx.Queue(maxsize=1)
+            self.yolo_stop = ctx.Event()
+            self.yolo_proc = ctx.Process(
+                target=_yolo_worker,
+                args=(weights, self.conf, self.yolo_in, self.yolo_out, self.yolo_stop),
+                daemon=True,
+            )
+            self.yolo_proc.start()
+            print(f"[yolo] worker process started ({weights})")
 
     def run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -343,10 +341,33 @@ class VideoReceiver(threading.Thread):
                         )
                         ids.append(int(tag.tag_id))
 
-                if self.yolo is not None and rf % self.yolo_interval == 0:
-                    res = self.yolo(frame, conf=self.conf, max_det=1, verbose=False)[0]
-                    for b in res.boxes:
-                        x1, y1, x2, y2 = map(int, b.xyxy[0])
+                if self.yolo_on and rf % self.yolo_interval == 0:
+                    # Hand the freshest frame to the worker without blocking.
+                    # If the worker is busy, drop the stale queued frame first so
+                    # video never backs up waiting on inference.
+                    try:
+                        if self.yolo_in.full():
+                            try:
+                                self.yolo_in.get_nowait()
+                            except Exception:
+                                pass
+                        self.yolo_in.put_nowait(frame.copy())
+                    except Exception:
+                        pass
+
+                # Pull any boxes the worker has ready (non-blocking) and cache
+                # them so they persist on-screen between inferences.
+                if self.yolo_on:
+                    try:
+                        got = self.yolo_out.get_nowait()
+                        if isinstance(got, tuple) and got and got[0] == "__error__":
+                            print(f"[yolo] worker failed: {got[1]} - detection off")
+                            self.yolo_on = False
+                        else:
+                            self.last_boxes = got
+                    except Exception:
+                        pass
+                    for x1, y1, x2, y2 in self.last_boxes:
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 180, 0), 2)
                 rf += 1
 
@@ -362,6 +383,20 @@ class VideoReceiver(threading.Thread):
 
         sock.close()
         self.rec.stop()
+        self._stop_yolo()
+
+    def _stop_yolo(self):
+        if self.yolo_proc is None:
+            return
+        try:
+            self.yolo_stop.set()
+            self.yolo_in.put_nowait(None)  # unblock the worker's get()
+        except Exception:
+            pass
+        self.yolo_proc.join(timeout=2.0)
+        if self.yolo_proc.is_alive():
+            self.yolo_proc.terminate()
+        self.yolo_proc = None
 
     def get_frame(self):
         with self.lock:
@@ -736,4 +771,9 @@ def main():
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass  # already set
     main()
