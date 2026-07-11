@@ -61,6 +61,69 @@ def to_pwm(x, amp):
     return int(NEUTRAL + x * amp)
 
 
+#!/usr/bin/env python3
+"""
+Combined topside ROV client (single pygame window):
+
+  * Thruster test panel (always runs, even with no video): pick a motion, it drives one
+    DOF at a fixed level for a fixed duration through the SAME mix/packet as the driver,
+    then neutral. STOP aborts. Same engine as pool_test.py / real_test_gui.py.
+  * Live video (shown inside the window when the stream is up; "NO VIDEO" otherwise),
+    with AprilTag (optional) and YOLO (optional, --weights) overlays and a RECORD button
+    that saves the clean stream to mp4.
+
+Mode (lan/wifi) is chosen at launch with --wifi and applies to both video and thrusters.
+Reads .rov_server_creds.
+
+  python rov_client.py
+  python rov_client.py --wifi --weights best.pt
+"""
+
+import argparse
+import configparser
+import os
+
+# cv2 and pygame both ship SDL2; allow the duplicate class registration quietly.
+os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+
+import socket
+import struct
+import sys
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime
+
+import cv2
+import numpy as np
+import pygame
+
+NEUTRAL = 1500
+LIGHT_OFF = 1100
+SENSOR_FMT = "<dff"  # (epoch_time, depth_m, yaw_deg) - matches rov_server.py
+
+
+# ---------- shared thruster core (identical to pool_test.py) ----------
+
+
+def clamp(x):
+    return max(-1.0, min(1.0, x))
+
+
+def mix(surge, strafe, heave, yaw):
+    fl = clamp(surge - strafe - yaw)
+    fr = clamp(surge + strafe + yaw)
+    rl = clamp(surge + strafe - yaw)
+    rr = clamp(surge - strafe + yaw)
+    v1 = clamp(heave)
+    v2 = clamp(-heave)
+    return fl, fr, rl, rr, v1, v2
+
+
+def to_pwm(x, amp):
+    return int(NEUTRAL + x * amp)
+
+
 def thruster_packet(thr, amp):
     fl, fr, rl, rr, v1, v2 = thr
     return struct.pack(
@@ -545,8 +608,10 @@ class App:
             if start_sensor and end_sensor:
                 d_depth = end_sensor[0] - start_sensor[0]
                 d_yaw = end_sensor[1] - start_sensor[1]
-                self.add_log(f"Δdepth={d_depth:+.3f} m   Δyaw={d_yaw:+.1f} deg")
-                self.set_status(f"Δdepth {d_depth:+.3f} m | Δyaw {d_yaw:+.1f} deg")
+                self.add_log(f"Δdepth={d_depth * 100:+.1f} cm   Δyaw={d_yaw:+.1f} deg")
+                self.set_status(
+                    f"Δdepth {d_depth * 100:+.1f} cm | Δyaw {d_yaw:+.1f} deg"
+                )
             else:
                 self.set_status(">>> STOP - measure start to rest (no sensor data)")
 
@@ -645,7 +710,7 @@ class App:
         # sensor readout (depth = heave, yaw)
         sv = self.sensors.get()
         if sv is not None:
-            sensor_txt = f"Depth: {sv[0]:+.2f} m    Yaw: {sv[1]:+.1f} deg"
+            sensor_txt = f"Depth: {sv[0] * 100:+.1f} cm    Yaw: {sv[1]:+.1f} deg"
             color = (120, 200, 230)
         else:
             sensor_txt = "Sensors: no data"
