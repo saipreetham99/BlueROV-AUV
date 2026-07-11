@@ -24,11 +24,14 @@ NEUTRAL = 1500
 LIGHT_OFF = 1100
 LIGHT_ON = 1900
 THRUSTER_CHANNELS = range(6)  # 0-5 are thrusters; skipped unless overridden
+PROTECTED_CHANNELS = {15}  # camera servo - never drive this
 
 
 def safe_state(pca):
-    """Thrusters held neutral (stopped), every other channel off."""
+    """Thrusters held neutral (stopped), other channels off. Camera untouched."""
     for ch in range(16):
+        if ch in PROTECTED_CHANNELS:
+            continue
         pca.pwm[ch] = NEUTRAL if ch in THRUSTER_CHANNELS else LIGHT_OFF
 
 
@@ -77,6 +80,7 @@ def main():
         channels = list(range(args.start, args.end + 1))
         if not args.include_thrusters:
             channels = [c for c in channels if c not in THRUSTER_CHANNELS]
+        channels = [c for c in channels if c not in PROTECTED_CHANNELS]
 
     print("Light finder - watch the light and note where it flashes.")
     print(f"Channels to test: {channels}")
