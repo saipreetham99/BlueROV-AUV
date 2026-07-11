@@ -238,7 +238,7 @@ def main():
     ap.add_argument(
         "--no-sensors", action="store_true", help="skip depth/IMU streaming"
     )
-    ap.add_argument("--depth-bus", type=int, default=1, help="I2C bus for the MS5837")
+    ap.add_argument("--depth-bus", type=int, default=6, help="I2C bus for the MS5837")
     ap.add_argument("--imu-bus", type=int, default=1, help="SPI bus for the ICM20602")
     ap.add_argument(
         "--imu-cs", type=int, default=2, help="SPI chip-select for the ICM20602"
