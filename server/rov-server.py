@@ -149,13 +149,34 @@ def video_loop(cfg, mode, source, chunk, quality_override):
         print("[video] stopped")
 
 
-def read_heading():
-    # TODO: fill in once the IMU driver is wired (e.g. icm20602 gyro integration).
-    # Should return yaw/heading in degrees. Placeholder until then.
-    return 0.0
+class HeadingTracker:
+    """Integrates the ICM20602 gyro Z-rate (deg/s) into a heading (deg). Estimates and
+    removes the resting bias once at startup so the heading doesn't drift while still."""
+
+    def __init__(self, bus=1, cs=2):
+        import icm20602
+
+        self.imu = icm20602.ICM20602(bus=bus, cs=cs)
+        # estimate resting yaw-rate bias from a short still average
+        n, acc = 60, 0.0
+        for _ in range(n):
+            acc += self.imu.read_all().g.z
+            time.sleep(0.005)
+        self.bias = acc / n
+        self.heading = 0.0
+        self.last_t = time.time()
+        print(f"[sensors] IMU ready (yaw-rate bias {self.bias:+.3f} deg/s)")
+
+    def update(self):
+        now = time.time()
+        dt = now - self.last_t
+        self.last_t = now
+        rate = self.imu.read_all().g.z - self.bias
+        self.heading += rate * dt
+        return self.heading
 
 
-def sensor_loop(cfg, mode, depth_bus, saltwater):
+def sensor_loop(cfg, mode, depth_bus, saltwater, imu_bus, imu_cs):
     try:
         client_ip = cfg[mode]["client_ip"]
     except (KeyError, configparser.NoSectionError) as e:
@@ -177,15 +198,20 @@ def sensor_loop(cfg, mode, depth_bus, saltwater):
         print(f"[sensors] depth sensor unavailable ({e}); sensors disabled")
         return
 
+    heading = None
+    try:
+        heading = HeadingTracker(bus=imu_bus, cs=imu_cs)
+    except Exception as e:
+        print(f"[sensors] IMU unavailable ({e}); yaw will read 0")
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     print(f"[sensors] streaming depth+yaw to {client_ip}:{port}")
     try:
         while not stop_event.is_set():
             try:
+                yaw = heading.update() if heading is not None else 0.0
                 if sensor.read():
-                    packet = struct.pack(
-                        SENSOR_FMT, time.time(), sensor.depth(), read_heading()
-                    )
+                    packet = struct.pack(SENSOR_FMT, time.time(), sensor.depth(), yaw)
                     sock.sendto(packet, (client_ip, port))
             except Exception as e:
                 print(f"[sensors] read error: {e}")
@@ -211,6 +237,10 @@ def main():
         "--no-sensors", action="store_true", help="skip depth/IMU streaming"
     )
     ap.add_argument("--depth-bus", type=int, default=1, help="I2C bus for the MS5837")
+    ap.add_argument("--imu-bus", type=int, default=1, help="SPI bus for the ICM20602")
+    ap.add_argument(
+        "--imu-cs", type=int, default=2, help="SPI chip-select for the ICM20602"
+    )
     ap.add_argument("--salt", action="store_true", help="use saltwater density")
     args = ap.parse_args()
 
@@ -233,7 +263,7 @@ def main():
         threads.append(
             threading.Thread(
                 target=sensor_loop,
-                args=(cfg, mode, args.depth_bus, args.salt),
+                args=(cfg, mode, args.depth_bus, args.salt, args.imu_bus, args.imu_cs),
                 daemon=True,
             )
         )
