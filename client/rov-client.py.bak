@@ -37,7 +37,6 @@ import pygame
 
 NEUTRAL = 1500
 LIGHT_OFF = 1100
-SENSOR_FMT = "<dff"  # (epoch_time, depth_m, yaw_deg) - matches rov_server.py
 
 
 # ---------- shared thruster core (identical to pool_test.py) ----------
@@ -94,63 +93,21 @@ def load_config(mode):
     return rov_ip, thruster_port, video_port, sensor_port
 
 
-class SensorReceiver(threading.Thread):
-    """Receives decoded depth/yaw packets from the sub, holds the latest value, and can
-    log a decoded CSV during a test."""
-
-    def __init__(self, port):
-        super().__init__(daemon=True)
-        self.port = port
-        self.stop_event = threading.Event()
-        self.lock = threading.Lock()
-        self.latest = None  # (t, depth_m, yaw_deg)
-        self.last_time = 0.0
-        self._csv = None
-
-    def run(self):
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(("", self.port))
-        except OSError as e:
-            print(f"[sensors] cannot bind port {self.port}: {e}")
-            return
-        s.settimeout(0.5)
-        size = struct.calcsize(SENSOR_FMT)
-        print(f"[sensors] listening on *:{self.port}")
-        while not self.stop_event.is_set():
+def capture_sensors(port, out_path, stop_event):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("", port))
+    s.settimeout(0.2)
+    t0 = time.time()
+    with open(out_path, "w") as f:
+        f.write("t_seconds,length,hex\n")
+        while not stop_event.is_set():
             try:
-                data, _ = s.recvfrom(256)
+                data, _ = s.recvfrom(4096)
             except socket.timeout:
                 continue
-            if len(data) != size:
-                continue
-            t, depth, yaw = struct.unpack(SENSOR_FMT, data)
-            with self.lock:
-                self.latest = (t, depth, yaw)
-                self.last_time = time.time()
-                if self._csv is not None:
-                    self._csv.write(f"{time.time():.4f},{depth:.4f},{yaw:.3f}\n")
-                    self._csv.flush()
-        s.close()
-
-    def get(self):
-        """Latest (depth_m, yaw_deg), or None if stale/absent."""
-        with self.lock:
-            if self.latest is None or time.time() - self.last_time > 2.0:
-                return None
-            return self.latest[1], self.latest[2]
-
-    def start_record(self, path):
-        with self.lock:
-            self._csv = open(path, "w")
-            self._csv.write("t_seconds,depth_m,yaw_deg\n")
-
-    def stop_record(self):
-        with self.lock:
-            if self._csv is not None:
-                self._csv.close()
-                self._csv = None
+            f.write(f"{time.time() - t0:.4f},{len(data)},{data.hex()}\n")
+    s.close()
 
 
 # ---------- video receiver (background thread, renders into pygame) ----------
@@ -380,10 +337,6 @@ class App:
         )
         self.video.start()
 
-        # sensors (depth + yaw)
-        self.sensors = SensorReceiver(self.sensor_port)
-        self.sensors.start()
-
         # video panel geometry
         self.vid_rect = pygame.Rect(370, 20, 610, 458)
 
@@ -503,10 +456,16 @@ class App:
         label = f"{motion} {'+' if sign > 0 else '-'}"
         self.add_log(f"{label}  amp={self.amp}  {self.duration}s")
 
-        recording = self.capture
-        if recording:
+        stop_event = threading.Event()
+        cap_thread = None
+        if self.capture:
             fname = f"capture_{motion}_{'+' if sign > 0 else '-'}_{time.strftime('%H%M%S')}.csv"
-            self.sensors.start_record(fname)
+            cap_thread = threading.Thread(
+                target=capture_sensors,
+                args=(self.sensor_port, fname, stop_event),
+                daemon=True,
+            )
+            cap_thread.start()
             self.add_log(f"recording -> {fname}")
 
         self.sock.sendto(neutral_packet(), self.thr_addr)
@@ -517,8 +476,6 @@ class App:
                 break
             self.set_status(f"Starting in {i}...")
             time.sleep(1.0)
-
-        start_sensor = self.sensors.get() if not self.abort else None
 
         if not self.abort:
             self.set_status(f">>> GO  ({label})")
@@ -532,26 +489,16 @@ class App:
                     time.sleep(d)
                 else:
                     t_next = time.time()
-            self.set_status("ABORTED" if self.abort else ">>> STOP - settling...")
+            self.set_status(
+                "ABORTED" if self.abort else ">>> STOP - measure start to rest"
+            )
 
         for _ in range(int(0.5 / dt) + 1):
             self.sock.sendto(neutral_packet(), self.thr_addr)
             time.sleep(dt)
-
-        # let the sub finish gliding, then read the net sensor change
-        if not self.abort:
-            time.sleep(2.0)
-            end_sensor = self.sensors.get()
-            if start_sensor and end_sensor:
-                d_depth = end_sensor[0] - start_sensor[0]
-                d_yaw = end_sensor[1] - start_sensor[1]
-                self.add_log(f"Δdepth={d_depth:+.3f} m   Δyaw={d_yaw:+.1f} deg")
-                self.set_status(f"Δdepth {d_depth:+.3f} m | Δyaw {d_yaw:+.1f} deg")
-            else:
-                self.set_status(">>> STOP - measure start to rest (no sensor data)")
-
-        if recording:
-            self.sensors.stop_record()
+        stop_event.set()
+        if cap_thread:
+            cap_thread.join(timeout=1.0)
         self.running = False
 
     # main loop
@@ -576,7 +523,6 @@ class App:
         except Exception:
             pass
         self.video.stop_event.set()
-        self.sensors.stop_event.set()
         time.sleep(0.1)
         pygame.quit()
 
@@ -641,16 +587,6 @@ class App:
             ),
             (565, 496),
         )
-
-        # sensor readout (depth = heave, yaw)
-        sv = self.sensors.get()
-        if sv is not None:
-            sensor_txt = f"Depth: {sv[0]:+.2f} m    Yaw: {sv[1]:+.1f} deg"
-            color = (120, 200, 230)
-        else:
-            sensor_txt = "Sensors: no data"
-            color = (150, 150, 150)
-        s.blit(self.f_status.render(sensor_txt, True, color), (565, 526))
 
         pygame.display.flip()
 
