@@ -187,7 +187,9 @@ def sensor_loop(cfg, mode, depth_bus, saltwater, imu_bus, imu_cs):
     try:
         import ms5837
 
-        sensor = ms5837.MS5837(bus=depth_bus)
+        sensor = ms5837.MS5837_30BA(
+            bus=depth_bus
+        )  # Bar30 = 30BA; auto-detect was failing
         if not sensor.init():
             print("[sensors] depth sensor init failed; sensors disabled")
             return
