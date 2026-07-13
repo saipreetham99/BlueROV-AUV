@@ -467,7 +467,10 @@ class App:
         self.rate = 50.0
         # light state
         self.light_on = False  # manual LIGHT toggle
-        self.tag_flash = False  # flash lights while an AprilTag is in view
+        self.tag_flash = False  # flash lights once when an AprilTag appears
+        # one-shot flash state (rising-edge trigger)
+        self._tag_was_present = False
+        self._flash_until = 0.0
         self.countdown = 3
         self.running = False
         self.abort = False
@@ -564,7 +567,8 @@ class App:
             )
         )
 
-        # light + apriltag-flash toggles (green while active)
+        # light + apriltag-flash toggles (moved to a new row at y=560 so they no
+        # longer overlap the AprilTag / depth / yaw readouts at y=496 / y=526)
         self.buttons.append(
             Button(
                 (370, 560, 180, 44),
@@ -597,12 +601,20 @@ class App:
     def current_light(self):
         """PWM to put in the packet's light channel right now.
 
-        If TAG FLASH is on and a tag is currently detected, blink the lights
-        (overriding the manual LIGHT state). Otherwise use the manual toggle.
+        If TAG FLASH is on, flash the lights ONCE (a single 0.3 s pulse) on the
+        rising edge — the moment a tag first appears. It will not flash again
+        until all tags leave the frame and a tag reappears. Otherwise use the
+        manual LIGHT toggle.
         """
-        if self.tag_flash and self.video.get_tag_ids():
-            # ~4 Hz blink: on/off every 0.25 s
-            return LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF
+        if self.tag_flash:
+            tags_present = bool(self.video.get_tag_ids())
+            now = time.time()
+            # rising edge: a tag just appeared -> arm a single flash
+            if tags_present and not self._tag_was_present:
+                self._flash_until = now + 0.3
+            self._tag_was_present = tags_present
+            if now < self._flash_until:
+                return LIGHT_ON
         return LIGHT_ON if self.light_on else LIGHT_OFF
 
     def set_dur(self, d):
