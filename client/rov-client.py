@@ -567,7 +567,7 @@ class App:
         # light + apriltag-flash toggles (green while active)
         self.buttons.append(
             Button(
-                (560, 486, 130, 44),
+                (370, 560, 180, 44),
                 lambda: "LIGHT: ON" if self.light_on else "LIGHT: OFF",
                 self.toggle_light,
                 (150, 130, 40),
@@ -576,7 +576,7 @@ class App:
         )
         self.buttons.append(
             Button(
-                (700, 486, 150, 44),
+                (560, 560, 180, 44),
                 lambda: "TAG FLASH: ON" if self.tag_flash else "TAG FLASH: OFF",
                 self.toggle_tag_flash,
                 (120, 90, 140),
