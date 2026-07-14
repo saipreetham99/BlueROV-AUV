@@ -467,10 +467,7 @@ class App:
         self.rate = 50.0
         # light state
         self.light_on = False  # manual LIGHT toggle
-        self.tag_flash = False  # flash lights once when an AprilTag appears
-        # one-shot flash state (rising-edge trigger)
-        self._tag_was_present = False
-        self._flash_until = 0.0
+        self.tag_flash = False  # flash lights while an AprilTag is in view
         self.countdown = 3
         self.running = False
         self.abort = False
@@ -567,11 +564,11 @@ class App:
             )
         )
 
-        # light + apriltag-flash toggles (moved to a new row at y=560 so they no
-        # longer overlap the AprilTag / depth / yaw readouts at y=496 / y=526)
+        # light + apriltag-flash toggles (green while active) - placed on a row
+        # below the tag/sensor readouts so they don't cover the ID text
         self.buttons.append(
             Button(
-                (370, 560, 180, 44),
+                (565, 560, 150, 44),
                 lambda: "LIGHT: ON" if self.light_on else "LIGHT: OFF",
                 self.toggle_light,
                 (150, 130, 40),
@@ -580,7 +577,7 @@ class App:
         )
         self.buttons.append(
             Button(
-                (560, 560, 180, 44),
+                (725, 560, 170, 44),
                 lambda: "TAG FLASH: ON" if self.tag_flash else "TAG FLASH: OFF",
                 self.toggle_tag_flash,
                 (120, 90, 140),
@@ -601,20 +598,12 @@ class App:
     def current_light(self):
         """PWM to put in the packet's light channel right now.
 
-        If TAG FLASH is on, flash the lights ONCE (a single 0.3 s pulse) on the
-        rising edge — the moment a tag first appears. It will not flash again
-        until all tags leave the frame and a tag reappears. Otherwise use the
-        manual LIGHT toggle.
+        If TAG FLASH is on and a tag is currently detected, blink the lights
+        (overriding the manual LIGHT state). Otherwise use the manual toggle.
         """
-        if self.tag_flash:
-            tags_present = bool(self.video.get_tag_ids())
-            now = time.time()
-            # rising edge: a tag just appeared -> arm a single flash
-            if tags_present and not self._tag_was_present:
-                self._flash_until = now + 0.3
-            self._tag_was_present = tags_present
-            if now < self._flash_until:
-                return LIGHT_ON
+        if self.tag_flash and self.video.get_tag_ids():
+            # ~4 Hz blink: on/off every 0.25 s
+            return LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF
         return LIGHT_ON if self.light_on else LIGHT_OFF
 
     def set_dur(self, d):
@@ -687,20 +676,32 @@ class App:
                     t_next = time.time()
             self.set_status("ABORTED" if self.abort else ">>> STOP - settling...")
 
+        # sensor state at thrust cutoff (end of powered phase), captured BEFORE the
+        # coast so we can split powered (start->cutoff) from glide (cutoff->rest)
+        mid_sensor = self.sensors.get() if not self.abort else None
+
         for _ in range(int(0.5 / dt) + 1):
             self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
             time.sleep(dt)
 
-        # let the sub finish gliding, then read the net sensor change
+        # let the sub finish gliding, then report powered vs glide for both DOFs
         if not self.abort:
             time.sleep(2.0)
             end_sensor = self.sensors.get()
-            if start_sensor and end_sensor:
-                d_depth = end_sensor[0] - start_sensor[0]
-                d_yaw = end_sensor[1] - start_sensor[1]
-                self.add_log(f"Δdepth={d_depth * 100:+.1f} cm   Δyaw={d_yaw:+.1f} deg")
+            if start_sensor and mid_sensor and end_sensor:
+                # depth in metres (matches the sim heave box); yaw in degrees
+                pow_depth = abs(mid_sensor[0] - start_sensor[0])  # start -> cutoff
+                gl_depth = abs(end_sensor[0] - mid_sensor[0])  # cutoff -> rest
+                pow_yaw = abs(mid_sensor[1] - start_sensor[1])
+                gl_yaw = abs(end_sensor[1] - mid_sensor[1])
+                self.add_log(
+                    f"depth  P {pow_depth:.3f} m ({pow_depth * 100:.1f} cm)  "
+                    f"G {gl_depth:.3f} m ({gl_depth * 100:.1f} cm)"
+                )
+                self.add_log(f"yaw    P {pow_yaw:.1f} deg  G {gl_yaw:.1f} deg")
                 self.set_status(
-                    f"Δdepth {d_depth * 100:+.1f} cm | Δyaw {d_yaw:+.1f} deg"
+                    f"P/G depth {pow_depth:.3f}/{gl_depth:.3f}m  "
+                    f"yaw {pow_yaw:.0f}/{gl_yaw:.0f}deg"
                 )
             else:
                 self.set_status(">>> STOP - measure start to rest (no sensor data)")
