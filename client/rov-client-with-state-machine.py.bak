@@ -5,6 +5,9 @@ Combined topside ROV client (single pygame window):
   * Thruster test panel (always runs, even with no video): pick a motion, it drives one
     DOF at a fixed level for a fixed duration through the SAME mix/packet as the driver,
     then neutral. STOP aborts. Same engine as pool_test.py / real_test_gui.py.
+  * Manual gamepad control (JOYSTICK button): left stick Y surge, right stick Y strafe,
+    RT heave up / right-stick-X-left heave down, XBOX/BACK yaw, D-pad amp +/-100,
+    X light, B tag-flash. Live whenever autonomy is off. Same mix/packet path.
   * Live video (shown inside the window when the stream is up; "NO VIDEO" otherwise),
     with AprilTag (optional) and YOLO (optional, --weights) overlays and a RECORD button
     that saves the clean stream to mp4.
@@ -54,6 +57,8 @@ SENSOR_FMT = "<dff"  # (epoch_time, depth_m, yaw_deg) - matches rov_server.py
 AMP_MIN = 0
 AMP_MAX = 400
 
+JOY_DEADZONE = 0.12  # ignore small stick drift around center
+
 
 # ---------- shared thruster core (identical to pool_test.py) ----------
 
@@ -98,14 +103,14 @@ def load_config(mode):
     path = os.path.expanduser(".rov_server_creds")
     cfg = configparser.ConfigParser()
     if not os.path.exists(path) or not cfg.read(path):
-        sys.exit(f"✗ ERROR: Config file not found or empty at '{path}'")
+        sys.exit(f"\u2717 ERROR: Config file not found or empty at '{path}'")
     try:
         rov_ip = cfg[mode]["rov_ip"]
         thruster_port = cfg.getint("DEFAULT", "thruster_port")
         video_port = cfg.getint("DEFAULT", "video_port")
         sensor_port = cfg.getint("DEFAULT", "imu_and_depth_port")
     except (KeyError, configparser.NoSectionError) as e:
-        sys.exit(f"✗ ERROR: Missing section or key in config: {e}")
+        sys.exit(f"\u2717 ERROR: Missing section or key in config: {e}")
     return rov_ip, thruster_port, video_port, sensor_port
 
 
@@ -210,7 +215,7 @@ import multiprocessing as mp
 def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
     """Runs in a SEPARATE process with a clean interpreter.
 
-    Imports torch/ultralytics here only — never in the pygame+cv2 process,
+    Imports torch/ultralytics here only -- never in the pygame+cv2 process,
     which avoids the native-library (SDL/cv2/torch) collision that segfaults
     when they share one process. Receives BGR frames on in_q, returns
     detection boxes on out_q as a list of (x1, y1, x2, y2) ints.
@@ -252,7 +257,7 @@ def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
 
 
 class VideoReceiver(threading.Thread):
-    def __init__(self, server_ip, port, weights=None, conf=0.5, yolo_interval=3):
+    def __init__(self, server_ip, port, weights=None, conf=0.8, yolo_interval=3):
         super().__init__(daemon=True)
         self.server_ip = server_ip
         self.port = port
@@ -330,6 +335,10 @@ class VideoReceiver(threading.Thread):
                 frame = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
                 if frame is None:
                     continue
+                # Camera is mounted rotated; make every frame upright BEFORE
+                # anything downstream (AprilTags, YOLO, recording, UI, autonomy)
+                # sees it, so all orientations stay consistent.
+                # frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 raw = frame.copy()
 
                 ids = []
@@ -510,6 +519,12 @@ class App:
         self.auto_state = "-"
         self.auto_cmd = (0.0, 0.0, 0.0, 0.0)
         self._auto_thread = None
+        # manual joystick (gamepad) control
+        self.joystick_on = False
+        self.joy = None
+        self.trig_rest = {4: -1.0, 5: -1.0}  # recalibrated when the mode is enabled
+        self.joy_cmd = (0.0, 0.0, 0.0, 0.0)
+        self._init_joystick()
         self.status = "Ready"
         self.log = []
         self.lock = threading.Lock()
@@ -528,8 +543,8 @@ class App:
         # video panel geometry
         self.vid_rect = pygame.Rect(370, 20, 610, 458)
 
-        # manual controls are locked out while autonomy is driving (and vice-versa)
-        idle = lambda: not self.running and not self.autonomous
+        # manual controls are locked out while autonomy OR the gamepad is driving
+        idle = lambda: not self.running and not self.autonomous and not self.joystick_on
         self.buttons = []
         self.buttons.append(
             Button((20, 90, 36, 36), "-", lambda: self.set_dur(-1), (80, 80, 90), idle)
@@ -537,7 +552,7 @@ class App:
         self.buttons.append(
             Button((120, 90, 36, 36), "+", lambda: self.set_dur(+1), (80, 80, 90), idle)
         )
-        # (AMP steppers removed — AMP is now the text box at self.amp_rect)
+        # (AMP steppers removed -- AMP is now the text box at self.amp_rect)
         self.buttons.append(
             Button(
                 (20, 135, 316, 32),
@@ -584,6 +599,30 @@ class App:
         )
         self.status_y = stop_y + 66
 
+        # manual gamepad: L-stick Y surge, R-stick Y strafe, RT heave up /
+        # R-stick X-left heave down, XBOX/BACK yaw, D-pad amp +/-100, X light,
+        # B tag-flash.
+        self.buttons.append(
+            Button(
+                (20, 645, 316, 46),
+                lambda: (
+                    "JOYSTICK: ON"
+                    if self.joystick_on
+                    else ("JOYSTICK: OFF" if self.joy else "JOYSTICK: NO PAD")
+                ),
+                self.toggle_joystick,
+                (60, 120, 140),
+                lambda: (
+                    self.joystick_on
+                    or (
+                        self.joy is not None
+                        and not self.autonomous
+                        and not self.running
+                    )
+                ),
+            )
+        )
+
         # video record button (below the video panel)
         self.buttons.append(
             Button(
@@ -626,7 +665,12 @@ class App:
                 (60, 140, 90),
                 lambda: (
                     self.autonomous
-                    or ((not self.running) and HAVE_STRATEGY and self.video.yolo_on)
+                    or (
+                        (not self.running)
+                        and not self.joystick_on
+                        and HAVE_STRATEGY
+                        and self.video.yolo_on
+                    )
                 ),
             )
         )
@@ -661,7 +705,12 @@ class App:
     def toggle_autonomous(self):
         if self.autonomous:
             self._stop_autonomy()
-        elif (not self.running) and HAVE_STRATEGY and self.video.yolo_on:
+        elif (
+            (not self.running)
+            and not self.joystick_on
+            and HAVE_STRATEGY
+            and self.video.yolo_on
+        ):
             self._start_autonomy()
 
     def _start_autonomy(self):
@@ -731,6 +780,108 @@ class App:
             except Exception:
                 pass
 
+    # ---- manual gamepad control ----
+    def _init_joystick(self):
+        """Grab joystick 0 if present. Safe to re-call to detect a pad plugged in later."""
+        try:
+            pygame.joystick.init()
+            if pygame.joystick.get_count() > 0:
+                self.joy = pygame.joystick.Joystick(0)
+                self.joy.init()
+                print(
+                    f"[pad] {self.joy.get_name()}  "
+                    f"axes={self.joy.get_numaxes()} buttons={self.joy.get_numbuttons()}"
+                )
+            else:
+                self.joy = None
+                print("[pad] no controller detected")
+        except pygame.error as e:
+            self.joy = None
+            print(f"[pad] init failed: {e}")
+
+    def toggle_joystick(self):
+        if self.joystick_on:
+            self._stop_joystick()
+        elif self.joy is not None and not self.autonomous and not self.running:
+            self._start_joystick()
+
+    def _start_joystick(self):
+        if self.joy is None:
+            self._init_joystick()
+        if self.joy is None:
+            self.set_status("JOYSTICK: no controller found")
+            return
+        self.abort = False
+        # Snapshot RT's resting value so heave-up is 0 when released, whether
+        # this pad rests its triggers at -1 or 0.
+        pygame.event.pump()
+        self.trig_rest[5] = self.joy.get_axis(5)
+        self.trig_rest[2] = self.joy.get_axis(2)
+        self.joystick_on = True
+        self.set_status(">>> JOYSTICK - manual control")
+        self.add_log(f"joystick ON  (amp={self.amp})")
+
+    def _stop_joystick(self):
+        self.joystick_on = False
+        for _ in range(5):
+            try:
+                self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
+            except Exception:
+                pass
+        self.set_status("JOYSTICK off - neutral sent")
+        self.add_log("joystick OFF")
+
+    def _trigger_amount(self, axis):
+        """0.0 (released) .. 1.0 (fully pressed), calibrated to this pad's rest value."""
+        rest = self.trig_rest.get(axis, -1.0)
+        span = 1.0 - rest
+        if abs(span) < 1e-6:
+            return 0.0
+        amt = max(0.0, min(1.0, (self.joy.get_axis(axis) - rest) / span))
+        return 0.0 if amt < 0.05 else amt
+
+    def read_joystick(self):
+        """Poll the pad -> (surge, strafe, heave, yaw), each clamped to [-1, 1].
+
+        surge  = LEFT_STICK_Y  (axis 1), up  -> forward
+        strafe = RIGHT_STICK_Y (axis 3), +1  -> right, -1 -> left
+        heave  = RT (axis 5) up  MINUS  RIGHT_STICK_X (axis 2) pushed-left down
+        yaw    = XBOX button (5) right, BACK button (4) left
+        """
+
+        def dz(v):
+            return 0.0 if abs(v) < JOY_DEADZONE else v
+
+        surge = dz(-self.joy.get_axis(1))  # LEFT_STICK_Y up -> forward
+        strafe = dz(self.joy.get_axis(3))  # RIGHT_STICK_Y +1 right, -1 left
+
+        heave_up = self._trigger_amount(5)  # RT trigger
+        # axis 2 rests at -1 (it's a trigger on this pad), so read it as a
+        # calibrated 0..1 press like RT instead of negating a stick value.
+        heave_down = self._trigger_amount(2)
+        heave = heave_up - heave_down
+        # --- ALT heave (both directions on R-stick X, no RT): replace the three
+        #     lines above with:  heave = dz(-self.joy.get_axis(2))   (X-right up)
+
+        yaw = 0.0
+        if self.joy.get_button(5):  # XBOX_BUTTON -> yaw right
+            yaw += 1.0
+        if self.joy.get_button(4):  # BACK       -> yaw left
+            yaw -= 1.0
+        return clamp(surge), clamp(strafe), clamp(heave), clamp(yaw)
+
+    def send_joystick(self):
+        """One control cycle: read the pad, mix, send a thruster packet."""
+        surge, strafe, heave, yaw = self.read_joystick()
+        self.joy_cmd = (surge, strafe, heave, yaw)
+        thr = mix(surge, strafe, heave, yaw)
+        try:
+            self.sock.sendto(
+                thruster_packet(thr, self.amp, self.current_light()), self.thr_addr
+            )
+        except Exception:
+            pass
+
     def set_dur(self, d):
         self.duration = max(1, min(15, self.duration + d))
 
@@ -771,6 +922,7 @@ class App:
     def stop(self):
         self.abort = True
         self.autonomous = False  # kills the autonomy loop too
+        self.joystick_on = False  # and manual gamepad control
         for _ in range(5):
             self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
         self.set_status("STOP - neutral sent")
@@ -880,28 +1032,48 @@ class App:
                         self.amp_text = self.amp_text[:-1]
                     elif e.unicode.isdigit() and len(self.amp_text) < 3:
                         self.amp_text += e.unicode
-            # idle keep-alive: when NOT running a test, send neutral packets
-            # carrying the current light value. Keeps LIGHT / TAG FLASH live and
-            # satisfies the server's 0.5s watchdog. ~20 Hz is plenty.
+                # ---- gamepad: D-pad steps amp, X/B toggle light/tag-flash ----
+                if (
+                    e.type == pygame.JOYHATMOTION
+                    and self.joystick_on
+                    and self.amp_editable()
+                ):
+                    if e.value[1] > 0:  # D-pad up
+                        self.amp = min(AMP_MAX, self.amp + 100)
+                        self.amp_text = str(self.amp)
+                    elif e.value[1] < 0:  # D-pad down
+                        self.amp = max(AMP_MIN, self.amp - 100)
+                        self.amp_text = str(self.amp)
+                if e.type == pygame.JOYBUTTONDOWN and self.joystick_on:
+                    if e.button == 2:  # X -> light toggle
+                        self.toggle_light()
+                    elif e.button == 1:  # B -> tag flash toggle
+                        self.toggle_tag_flash()
+            # idle keep-alive / manual drive: when NOT running a test and NOT
+            # autonomous, either drive from the pad (which also serves as the
+            # server keep-alive) or send neutral packets carrying the current
+            # light value. Keeps LIGHT / TAG FLASH live and satisfies the
+            # server's 0.5s watchdog. ~20-30 Hz is plenty.
             now = time.time()
-            if (
-                not self.running
-                and not self.autonomous
-                and now - last_keepalive >= 0.05
-            ):
-                try:
-                    self.sock.sendto(
-                        neutral_packet(self.current_light()), self.thr_addr
-                    )
-                except Exception:
-                    pass
-                last_keepalive = now
+            if not self.running and not self.autonomous:
+                if self.joystick_on and self.joy is not None:
+                    self.send_joystick()
+                    last_keepalive = now
+                elif now - last_keepalive >= 0.05:
+                    try:
+                        self.sock.sendto(
+                            neutral_packet(self.current_light()), self.thr_addr
+                        )
+                    except Exception:
+                        pass
+                    last_keepalive = now
             self.draw()
             clock.tick(30)
 
     def shutdown(self):
         self.abort = True
         self.autonomous = False
+        self.joystick_on = False
         try:
             self.sock.sendto(neutral_packet(), self.thr_addr)
         except Exception:
@@ -975,7 +1147,7 @@ class App:
 
         if self.video.rec.on:
             s.blit(
-                self.f_small.render("● REC", True, (255, 80, 80)),
+                self.f_small.render("\u25cf REC", True, (255, 80, 80)),
                 (self.vid_rect.x + 8, self.vid_rect.y + 8),
             )
 
@@ -983,6 +1155,21 @@ class App:
             s.blit(
                 self.f_status.render(self.auto_state, True, (120, 230, 150)),
                 (self.vid_rect.x + 8, self.vid_rect.y + 26),
+            )
+        elif self.joystick_on:
+            su, st_, hv, yw = self.joy_cmd
+            s.blit(
+                self.f_status.render("MANUAL (pad)", True, (120, 200, 230)),
+                (self.vid_rect.x + 8, self.vid_rect.y + 26),
+            )
+            s.blit(
+                self.f_small.render(
+                    f"surge {su:+.2f}  strafe {st_:+.2f}  "
+                    f"heave {hv:+.2f}  yaw {yw:+.2f}",
+                    True,
+                    (150, 200, 220),
+                ),
+                (self.vid_rect.x + 8, self.vid_rect.y + 52),
             )
 
         # AprilTag readout
@@ -1015,7 +1202,7 @@ class App:
             auto_col = (120, 230, 150)
         elif not HAVE_STRATEGY:
             auto_txt = "AUTO: strategy_full.py not found"
-            auto_col = (200, 140, 120)
+            auto_col = (200, 140, 128)
         elif not self.video.yolo_on:
             auto_txt = "AUTO: needs YOLO (start with --weights)"
             auto_col = (150, 150, 150)
@@ -1035,7 +1222,7 @@ def main():
     ap.add_argument(
         "--weights", default=None, help="YOLOv8 weights to enable detection"
     )
-    ap.add_argument("--conf", type=float, default=0.5)
+    ap.add_argument("--conf", type=float, default=0.8)
     ap.add_argument("--yolo-interval", type=int, default=3)
     args = ap.parse_args()
     mode = "wifi" if args.wifi else "lan"

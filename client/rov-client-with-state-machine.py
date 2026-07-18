@@ -505,6 +505,11 @@ class App:
         self.amp_rect = pygame.Rect(200, 90, 130, 36)
         self.amp_text = str(self.amp)
         self.amp_active = False
+        # "Tags to finish": unique-AprilTag target, click-to-type box.
+        self.tag_target = 2
+        self.target_rect = pygame.Rect(372, 552, 46, 36)
+        self.target_text = str(self.tag_target)
+        self.target_active = False
         self.capture = False
         self.rate = 50.0
         # light state
@@ -519,6 +524,12 @@ class App:
         self.auto_state = "-"
         self.auto_cmd = (0.0, 0.0, 0.0, 0.0)
         self._auto_thread = None
+        # unique-AprilTag termination memory (latched until RESET TAGS):
+        # while autonomous, each distinct tag ID seen is remembered; reaching
+        # tag_target flashes the lights and hands off to the pad.
+        self.collected_tags = set()
+        self.mission_complete = False
+        self.celebrate_until = 0.0  # lights flash while now < this
         # manual joystick (gamepad) control
         self.joystick_on = False
         self.joy = None
@@ -655,6 +666,17 @@ class App:
             )
         )
 
+        # RESET TAGS: clear collected unique tags + un-latch completion.
+        self.buttons.append(
+            Button(
+                (432, 552, 126, 38),
+                "RESET TAGS",
+                self.reset_tags,
+                (120, 90, 90),
+                lambda: True,
+            )
+        )
+
         # AUTONOMOUS toggle: YOLO box -> strategy_full brain -> thrusters.
         # Enabled only with the brain imported + YOLO running; always toggle-OFF-able.
         self.buttons.append(
@@ -690,12 +712,54 @@ class App:
     def toggle_tag_flash(self):
         self.tag_flash = not self.tag_flash
 
+    # ---- unique-AprilTag target box + collection memory ----
+    def target_editable(self):
+        """Only allow editing the tag target while nothing is driving the sub."""
+        return not self.running and not self.autonomous
+
+    def commit_target(self):
+        """Parse the typed target, clamp to 1..99, and deactivate the box.
+        Empty or non-numeric input falls back to the current target."""
+        try:
+            v = int(self.target_text)
+        except (ValueError, TypeError):
+            v = self.tag_target
+        v = max(1, min(99, v))
+        self.tag_target = v
+        self.target_text = str(v)
+        self.target_active = False
+
+    def reset_tags(self):
+        """Clear the collected unique tags and un-latch mission complete."""
+        self.collected_tags.clear()
+        self.mission_complete = False
+        self.celebrate_until = 0.0
+        self.set_status("tag collection reset (0 collected)")
+        self.add_log("tags reset")
+
+    def _complete_mission(self):
+        """Target reached: flash the lights, stop autonomy, hand off to the pad."""
+        self.mission_complete = True
+        self.celebrate_until = time.time() + 3.0  # ~3 s celebration flash
+        got = sorted(self.collected_tags)
+        self._stop_autonomy()  # end chase & orbit, sub -> neutral
+        self.add_log(f"COMPLETE {len(got)} unique tags {got}")
+        if self.joy is not None:
+            self._start_joystick()  # auto hand-off to the gamepad
+            self.set_status(f">>> COMPLETE ({len(got)} tags) - JOYSTICK on")
+        else:
+            self.set_status(f">>> COMPLETE ({len(got)} tags) - no pad connected")
+
     def current_light(self):
         """PWM to put in the packet's light channel right now.
 
-        If TAG FLASH is on and a tag is currently detected, blink the lights
-        (overriding the manual LIGHT state). Otherwise use the manual toggle.
+        Celebration flash (just after the unique-tag target is met) overrides
+        everything. Otherwise, if TAG FLASH is on and a tag is currently
+        detected, blink; otherwise use the manual LIGHT toggle.
         """
+        if time.time() < self.celebrate_until:
+            # ~4 Hz celebration blink
+            return LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF
         if self.tag_flash and self.video.get_tag_ids():
             # ~4 Hz blink: on/off every 0.25 s
             return LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF
@@ -717,6 +781,10 @@ class App:
         # Build the brain in the SAME 640x480 frame it was tuned in; the worker
         # scales each YOLO box into that frame, so strategy_gains.json transfers
         # from the sim unchanged.
+        # Fresh collection each run: restarting autonomy clears any latched tags.
+        self.collected_tags.clear()
+        self.mission_complete = False
+        self.celebrate_until = 0.0
         self.strategy = Strategy(camera_width=640, camera_height=480)
         self.abort = False
         self.autonomous = True
@@ -1012,12 +1080,21 @@ class App:
                     self.shutdown()
                     return
                 if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
-                    # AMP text box: click inside to focus, click outside to commit.
+                    # Text boxes: click inside to focus, click outside to commit.
                     if self.amp_rect.collidepoint(e.pos) and self.amp_editable():
+                        if self.target_active:
+                            self.commit_target()
                         self.amp_active = True
+                        continue
+                    if self.target_rect.collidepoint(e.pos) and self.target_editable():
+                        if self.amp_active:
+                            self.commit_amp()
+                        self.target_active = True
                         continue
                     if self.amp_active:
                         self.commit_amp()
+                    if self.target_active:
+                        self.commit_target()
                     for b in self.buttons:
                         if b.click(e.pos):
                             break
@@ -1032,6 +1109,16 @@ class App:
                         self.amp_text = self.amp_text[:-1]
                     elif e.unicode.isdigit() and len(self.amp_text) < 3:
                         self.amp_text += e.unicode
+                if e.type == pygame.KEYDOWN and self.target_active:
+                    if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        self.commit_target()
+                    elif e.key == pygame.K_ESCAPE:
+                        self.target_text = str(self.tag_target)
+                        self.target_active = False
+                    elif e.key == pygame.K_BACKSPACE:
+                        self.target_text = self.target_text[:-1]
+                    elif e.unicode.isdigit() and len(self.target_text) < 2:
+                        self.target_text += e.unicode
                 # ---- gamepad: D-pad steps amp, X/B toggle light/tag-flash ----
                 if (
                     e.type == pygame.JOYHATMOTION
@@ -1049,6 +1136,22 @@ class App:
                         self.toggle_light()
                     elif e.button == 1:  # B -> tag flash toggle
                         self.toggle_tag_flash()
+            # Collect unique AprilTags while autonomous. They don't have to be
+            # seen together -- each new ID is remembered until RESET TAGS.
+            # Reaching tag_target flashes the lights and hands off to the pad.
+            if self.autonomous and not self.mission_complete:
+                ids = self.video.get_tag_ids()
+                if ids:
+                    before = len(self.collected_tags)
+                    self.collected_tags.update(ids)
+                    if len(self.collected_tags) != before:
+                        self.add_log(
+                            f"unique tags {len(self.collected_tags)}/{self.tag_target}: "
+                            f"{sorted(self.collected_tags)}"
+                        )
+                    if len(self.collected_tags) >= self.tag_target:
+                        self._complete_mission()
+
             # idle keep-alive / manual drive: when NOT running a test and NOT
             # autonomous, either drive from the pad (which also serves as the
             # server keep-alive) or send neutral packets carrying the current
@@ -1191,6 +1294,32 @@ class App:
             sensor_txt = "Sensors: no data"
             color = (150, 150, 150)
         s.blit(self.f_status.render(sensor_txt, True, color), (565, 526))
+
+        # tag-collection: caption + target text box + progress
+        s.blit(self.f_small.render("Tags to finish", True, (180, 180, 180)), (372, 534))
+        t_edit = self.target_editable()
+        if self.target_active:
+            tbg, tbd = (60, 70, 90), (255, 230, 120)
+        elif t_edit:
+            tbg, tbd = (45, 47, 55), (150, 150, 160)
+        else:
+            tbg, tbd = (40, 40, 45), (80, 80, 85)
+        pygame.draw.rect(s, tbg, self.target_rect, border_radius=6)
+        pygame.draw.rect(s, tbd, self.target_rect, width=2, border_radius=6)
+        tdisp = self.target_text if self.target_active else str(self.tag_target)
+        if self.target_active and int(time.time() * 2) % 2 == 0:
+            tdisp += "|"
+        tcol = (255, 255, 255) if t_edit else (120, 120, 120)
+        tt = self.f_status.render(tdisp, True, tcol)
+        s.blit(
+            tt, tt.get_rect(midleft=(self.target_rect.x + 8, self.target_rect.centery))
+        )
+        n_got = len(self.collected_tags)
+        if self.mission_complete:
+            prog_txt, prog_col = f"COMPLETE  {n_got}/{self.tag_target}", (120, 230, 150)
+        else:
+            prog_txt, prog_col = f"Collected {n_got}/{self.tag_target}", (170, 170, 175)
+        s.blit(self.f_small.render(prog_txt, True, prog_col), (372, 596))
 
         # autonomy readout (state + the four commands going into the mixer)
         if self.autonomous:
