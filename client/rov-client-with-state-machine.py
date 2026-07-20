@@ -653,7 +653,7 @@ class App:
                 lambda: "LIGHT: ON" if self.light_on else "LIGHT: OFF",
                 self.toggle_light,
                 (150, 130, 40),
-                lambda: True,
+                lambda: not self.autonomous,  # greyed during a hunt
             )
         )
         self.buttons.append(
@@ -662,7 +662,7 @@ class App:
                 lambda: "TAG FLASH: ON" if self.tag_flash else "TAG FLASH: OFF",
                 self.toggle_tag_flash,
                 (120, 90, 140),
-                lambda: True,
+                lambda: not self.autonomous,  # greyed during a hunt
             )
         )
 
@@ -714,8 +714,9 @@ class App:
 
     # ---- unique-AprilTag target box + collection memory ----
     def target_editable(self):
-        """Only allow editing the tag target while nothing is driving the sub."""
-        return not self.running and not self.autonomous
+        """Editable except during a thruster test. Tags-to-finish is read live,
+        so it can be changed during a hunt."""
+        return not self.running
 
     def commit_target(self):
         """Parse the typed target, clamp to 1..99, and deactivate the box.
@@ -738,9 +739,14 @@ class App:
         self.add_log("tags reset")
 
     def _complete_mission(self):
-        """Target reached: flash the lights, stop autonomy, hand off to the pad."""
+        """Target reached: flash the lights, reset the manual light state, stop
+        autonomy, and hand off to the pad."""
         self.mission_complete = True
         self.celebrate_until = time.time() + 3.0  # ~3 s celebration flash
+        # reset the manual light toggles so control hands off to the pad clean:
+        # after the celebration blink the light is off and nothing is strobing.
+        self.light_on = False
+        self.tag_flash = False
         got = sorted(self.collected_tags)
         self._stop_autonomy()  # end chase & orbit, sub -> neutral
         self.add_log(f"COMPLETE {len(got)} unique tags {got}")
@@ -753,13 +759,18 @@ class App:
     def current_light(self):
         """PWM to put in the packet's light channel right now.
 
-        Celebration flash (just after the unique-tag target is met) overrides
-        everything. Otherwise, if TAG FLASH is on and a tag is currently
-        detected, blink; otherwise use the manual LIGHT toggle.
+        Priority: the win celebration flash overrides everything; then, while
+        autonomous, the light stays off; otherwise TAG FLASH blinks when a tag is
+        seen, else the manual LIGHT toggle wins.
         """
         if time.time() < self.celebrate_until:
             # ~4 Hz celebration blink
             return LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF
+        # While autonomous the light stays off: LIGHT/TAG FLASH are greyed out and
+        # don't affect the win, so the win celebration above is the only light
+        # event during a hunt.
+        if self.autonomous:
+            return LIGHT_OFF
         if self.tag_flash and self.video.get_tag_ids():
             # ~4 Hz blink: on/off every 0.25 s
             return LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF
@@ -825,7 +836,12 @@ class App:
             else:
                 box = BoundingBox()  # nothing seen -> the brain searches
 
-            surge, strafe, heave, yaw, flash = self.strategy.update(box, dt)
+            # Tags live on the back, so "a tag is in view" == "I'm looking at the
+            # back". Feed that in so ORBITING knows when to stop and SCAN.
+            back_visible = bool(self.video.get_tag_ids())
+            surge, strafe, heave, yaw, flash = self.strategy.update(
+                box, dt, back_visible
+            )
             thr = mix(surge, strafe, heave, yaw)
             light = LIGHT_ON if flash else self.current_light()  # blink on a win
             try:
@@ -955,8 +971,9 @@ class App:
 
     # ---- AMP text box ----
     def amp_editable(self):
-        """The box only accepts focus/typing while nothing is driving the sub."""
-        return not self.running and not self.autonomous
+        """Editable except during a thruster test. The autonomy worker reads AMP
+        every loop, so it can be tuned live during a hunt."""
+        return not self.running
 
     def commit_amp(self):
         """Parse the typed text, clamp to AMP_MIN..AMP_MAX, and deactivate the box.

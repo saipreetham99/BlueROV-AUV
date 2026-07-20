@@ -82,20 +82,30 @@ PARAMS = [
         "Go back to chasing if the target shrinks below this x the enter size.",
     ),
     (
-        "orbit_to_win_s",
-        "Orbit -> win (s)",
+        "orbit_hold_frac",
+        "Orbit hold (frac)",
+        0.0,
+        0.5,
+        0.005,
+        "Box size (frac of frame) the orbit holds -- this sets the orbit radius. "
+        "Keep it above orbit-exit or it'll bounce back to chasing.",
+    ),
+    (
+        "orbit_surge_kp",
+        "Orbit radius kp",
+        0.0,
+        40.0,
+        0.5,
+        "How hard it corrects distance to the hold size (higher = tighter radius). "
+        "0 = no radius hold, so the orbit slowly spirals outward.",
+    ),
+    (
+        "orbit_flip_s",
+        "Orbit flip (s)",
         0.0,
         30.0,
         0.5,
-        "Seconds of continuous orbiting that count as a win.",
-    ),
-    (
-        "celebrate_s",
-        "Celebrate (s)",
-        0.0,
-        15.0,
-        0.5,
-        "Seconds spent flashing the light after a win.",
+        "Seconds of circling with no back in view before reversing orbit direction.",
     ),
     (
         "grace_s",
@@ -114,6 +124,22 @@ PARAMS = [
         "Speed of the full-circle spin while searching. Raise for a faster sweep; "
         "lower if it whips past the target without locking on (esp. real-sub YOLO).",
     ),
+    (
+        "search_heave_command",
+        "Search depth sweep",
+        0.0,
+        1.0,
+        0.01,
+        "Up/down bob amplitude while searching (0-1). 0 = spin flat, no depth sweep.",
+    ),
+    (
+        "search_heave_period_s",
+        "Search sweep period (s)",
+        1.0,
+        12.0,
+        0.5,
+        "Seconds for one full up-down depth-sweep cycle while searching.",
+    ),
 ]
 
 DEFAULTS = {
@@ -124,10 +150,13 @@ DEFAULTS = {
     "max_yaw_error_for_strafe": 80.0,
     "orbit_enter_frac": 0.05,
     "orbit_exit_ratio": 0.75,
-    "orbit_to_win_s": 10.0,
-    "celebrate_s": 5.0,
+    "orbit_hold_frac": 0.06,
+    "orbit_surge_kp": 10.0,
+    "orbit_flip_s": 6.0,
     "grace_s": 0.5,
     "search_yaw_command": 0.1,
+    "search_heave_command": 0.2,
+    "search_heave_period_s": 4.0,
 }
 
 
@@ -155,9 +184,15 @@ def load_gains():
 def fmt(key, v):
     if key in ("yaw_kp", "heave_kp"):
         return f"{v:.5f}"
-    if key in ("search_yaw_command", "orbit_enter_frac"):
+    if key in ("search_yaw_command", "orbit_enter_frac", "orbit_hold_frac"):
         return f"{v:.3f}"
-    if key in ("advance_surge", "orbit_strafe", "orbit_exit_ratio", "grace_s"):
+    if key in (
+        "advance_surge",
+        "orbit_strafe",
+        "orbit_exit_ratio",
+        "grace_s",
+        "search_heave_command",
+    ):
         return f"{v:.2f}"
     return f"{v:.1f}"
 
