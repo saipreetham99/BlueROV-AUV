@@ -218,7 +218,7 @@ def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
     Imports torch/ultralytics here only -- never in the pygame+cv2 process,
     which avoids the native-library (SDL/cv2/torch) collision that segfaults
     when they share one process. Receives BGR frames on in_q, returns
-    detection boxes on out_q as a list of (x1, y1, x2, y2) ints.
+    detection boxes on out_q as a list of (x1, y1, x2, y2, conf).
     """
     try:
         from ultralytics import YOLO
@@ -241,7 +241,7 @@ def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
             break
         try:
             res = model(frame, conf=conf, max_det=1, verbose=False)[0]
-            boxes = [tuple(map(int, b.xyxy[0])) for b in res.boxes]
+            boxes = [(*map(int, b.xyxy[0]), float(b.conf[0])) for b in res.boxes]
         except Exception:
             boxes = []
         # Keep only the freshest result: clear any stale box list first.
@@ -393,8 +393,17 @@ class VideoReceiver(threading.Thread):
                             self.last_boxes = got
                     except Exception:
                         pass
-                    for x1, y1, x2, y2 in self.last_boxes:
+                    for x1, y1, x2, y2, cf in self.last_boxes:
                         cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 180, 0), 2)
+                        cv2.putText(
+                            frame,
+                            f"{cf:.2f}",
+                            (x1, max(y1 - 6, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (255, 180, 0),
+                            2,
+                        )
                 rf += 1
 
                 self.rec.write(raw)
@@ -825,7 +834,7 @@ class App:
 
             raw, (fw, fh) = self.video.get_detection()
             if raw is not None and fw and fh:
-                x1, y1, x2, y2 = raw
+                x1, y1, x2, y2 = raw[:4]
                 sx, sy = 640.0 / fw, 480.0 / fh  # -> the strategy's tuning frame
                 box = BoundingBox(
                     x=x1 * sx,
