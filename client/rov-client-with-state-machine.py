@@ -41,7 +41,7 @@ import pygame
 # Autonomy brain: the SAME class the sim (run_sim.py) and the real sub use.
 # Optional import so the manual UI still works if the file isn't next to us.
 try:
-    from strategy_full import Strategy, BoundingBox
+    from aqua_strategy import Strategy, BoundingBox
 
     HAVE_STRATEGY = True
     _STRATEGY_ERR = ""
