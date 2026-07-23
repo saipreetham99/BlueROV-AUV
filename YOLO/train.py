@@ -109,7 +109,9 @@ def main():
 
     best = os.path.join("runs", "detect", args.name, "weights", "best.pt")
     print(f"\n[train] done -> {best}")
-    print(f"[train] run it with:  python rov_client.py --weights {best}")
+    print(
+        f"[train] run it with:  python rov-client-with-state-machine.py --weights {best}"
+    )
 
 
 if __name__ == "__main__":
