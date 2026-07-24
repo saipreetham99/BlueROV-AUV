@@ -22,125 +22,6 @@ import configparser
 import os
 import inspect
 import importlib
-
-# cv2 and pygame both ship SDL2; allow the duplicate class registration quietly.
-os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
-import socket
-import struct
-import sys
-import threading
-import time
-from collections import defaultdict
-from datetime import datetime
-import cv2
-import numpy as np
-import pygame
-
-# Autonomy brain: the SAME class the sim (run_sim.py) and the real sub use.
-# Which module is loaded is chosen at launch with --strategy (default below).
-# main() calls load_strategy() and fills these globals in before App is built,
-# so the manual UI still works if the chosen brain isn't importable.
-Strategy = None
-BoundingBox = None
-HAVE_STRATEGY = False
-_STRATEGY_ERR = ""
-_STRATEGY_NAME = "strategy_full"  # updated by main() to whatever --strategy picked
-
-
-def load_strategy(module_name):
-    """Import Strategy + BoundingBox from the named module (no .py extension).
-    Returns (Strategy, BoundingBox, ok, err). On failure ok is False and the
-    autonomy button stays disabled -- the manual UI is unaffected."""
-    try:
-        mod = importlib.import_module(module_name)
-        return mod.Strategy, mod.BoundingBox, True, ""
-    except Exception as e:  # noqa: BLE001 - missing file etc. -> autonomy disabled
-        return None, None, False, str(e)
-
-
-NEUTRAL = 1500
-LIGHT_OFF = 1100
-LIGHT_ON = 1900
-SENSOR_FMT = "<dff"  # (epoch_time, depth_m, yaw_deg) - matches rov_server.py
-AMP_MIN = 0
-AMP_MAX = 400
-JOY_DEADZONE = 0.12  # ignore small stick drift around center
-
-
-# ---------- shared thruster core (identical to pool_test.py) ----------
-def clamp(x):
-    return max(-1.0, min(1.0, x))
-
-
-def mix(surge, strafe, heave, yaw):
-    fl = clamp(surge - strafe - yaw)
-    fr = clamp(surge + strafe + yaw)
-    rl = clamp(surge + strafe - yaw)
-    rr = clamp(surge - strafe + yaw)
-    v1 = clamp(heave)
-    v2 = clamp(-heave)
-    return fl, fr, rl, rr, v1, v2
-
-
-def to_pwm(x, amp):
-    return int(NEUTRAL + x * amp)
-
-
-def thruster_packet(thr, amp, light=LIGHT_OFF):
-    fl, fr, rl, rr, v1, v2 = thr
-    return struct.pack(
-        "<7H",
-        to_pwm(fl, amp),
-        to_pwm(fr, amp),
-        to_pwm(rl, amp),
-        to_pwm(rr, amp),
-        to_pwm(v1, amp),
-        to_pwm(v2, amp),
-        light,
-    )
-
-
-def neutral_packet(light=LIGHT_OFF):
-    return struct.pack("<7H", *([NEUTRAL] * 6), light)
-
-
-def load_config(mode):
-    path = os.path.expanduser(".rov_server_creds")
-    cfg = configparser.ConfigParser()
-    if not os.path.exists(path) or not cfg.read(path):
-        sys.exit(f"\u2717 ERROR: Config file not found or empty at '{path}'")
-    try:
-        rov_ip = cfg[mode]["rov_ip"]
-        thruster_port = cfg.getint("DEFAULT", "thruster_port")
-        video_port = cfg.getint("DEFAULT", "video_port")
-        sensor_port = cfg.getint("DEFAULT", "imu_and_depth_port")
-    except (KeyError, configparser.NoSectionError) as e:
-        sys.exit(f"\u2717 ERROR: Missing section or key in config: {e}")
-
-
-#!/usr/bin/env python3
-"""
-Combined topside ROV client (single pygame window):
-  * Thruster test panel (always runs, even with no video): pick a motion, it drives one
-    DOF at a fixed level for a fixed duration through the SAME mix/packet as the driver,
-    then neutral. STOP aborts. Same engine as pool_test.py / real_test_gui.py.
-  * Manual gamepad control (JOYSTICK button): left stick Y surge, right stick Y strafe,
-    RT heave up / right-stick-X-left heave down, XBOX/BACK yaw, D-pad amp +/-100,
-    X light, B tag-flash. Live whenever autonomy is off. Same mix/packet path.
-  * Live video (shown inside the window when the stream is up; "NO VIDEO" otherwise),
-    with AprilTag (optional) and YOLO (optional, --weights) overlays and a RECORD button
-    that saves the clean stream to mp4.
-Mode (lan/wifi) is chosen at launch with --wifi and applies to both video and thrusters.
-Reads .rov_server_creds.
-  python rov_client.py
-  python rov_client.py --wifi --weights best.pt
-  python rov_client.py --weights best.pt --strategy aqua_strategy
-"""
-import argparse
-import configparser
-import os
-import inspect
-import importlib
 import json
 
 # cv2 and pygame both ship SDL2; allow the duplicate class registration quietly.
@@ -669,7 +550,7 @@ class VideoReceiver(threading.Thread):
         self.server_ip = server_ip
         self.port = port
         self.conf = conf
-        self.yolo_interval = max(1, yolo_interval)
+        self.yolo_interval = max(1, yolo_interval)  # kept for compatibility; unused now
         self.stop_event = threading.Event()
         self.lock = threading.Lock()
         self.latest = None
@@ -684,6 +565,13 @@ class VideoReceiver(threading.Thread):
             print("[tags] AprilTag detection on")
         except ImportError:
             print("[tags] pupil_apriltags not installed - tag overlay off")
+        # AprilTag detect() is CPU-heavy; run it every Nth frame (not every frame)
+        # so it can't throttle the YOLO/box path. Between detections we reuse and
+        # redraw the last result, so tag_ids stays populated for the mission
+        # counter and the orbit back_visible signal.
+        self.tag_interval = 5  # detect ~6 Hz at 30 fps video
+        self._last_tag_ids = []
+        self._last_tag_hits = []  # cached (corners, center, id) for the overlay
         # YOLO runs in a separate process (see _yolo_worker). Torch is never
         # imported in this process, so it can't collide with pygame/cv2/SDL.
         self.yolo_on = bool(weights)
@@ -742,35 +630,46 @@ class VideoReceiver(threading.Thread):
                 # sees it, so all orientations stay consistent.
                 # frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
                 raw = frame.copy()
-                ids = []
-                if self.tag_det is not None:
+                # Refresh AprilTag detection only every tag_interval-th frame and
+                # reuse the cached result in between. This keeps the expensive
+                # detect() call off the per-frame path so it can't slow the box
+                # down. ids stays populated for the mission counter + back_visible.
+                if self.tag_det is not None and rf % self.tag_interval == 0:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    self._last_tag_ids = []
+                    self._last_tag_hits = []
                     for tag in self.tag_det.detect(gray):
                         pts = tag.corners.astype(int)
-                        for i in range(4):
-                            cv2.line(
-                                frame,
-                                tuple(pts[i]),
-                                tuple(pts[(i + 1) % 4]),
-                                (0, 255, 0),
-                                2,
-                            )
-                        cx, cy = map(int, tag.center)
-                        cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
-                        cv2.putText(
+                        ctr = tuple(map(int, tag.center))
+                        self._last_tag_hits.append((pts, ctr, int(tag.tag_id)))
+                        self._last_tag_ids.append(int(tag.tag_id))
+                ids = self._last_tag_ids
+                # redraw the cached tags every frame (cheap) so the overlay stays
+                # smooth even on the frames we skip detection
+                for pts, (cx, cy), tid in self._last_tag_hits:
+                    for i in range(4):
+                        cv2.line(
                             frame,
-                            f"id {tag.tag_id}",
-                            (cx + 8, cy - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.7,
+                            tuple(pts[i]),
+                            tuple(pts[(i + 1) % 4]),
                             (0, 255, 0),
                             2,
                         )
-                        ids.append(int(tag.tag_id))
-                if self.yolo_on and rf % self.yolo_interval == 0:
-                    # Hand the freshest frame to the worker without blocking.
-                    # If the worker is busy, drop the stale queued frame first so
-                    # video never backs up waiting on inference.
+                    cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+                    cv2.putText(
+                        frame,
+                        f"id {tid}",
+                        (cx + 8, cy - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                    )
+                # Hand the freshest frame to the YOLO worker EVERY frame (no
+                # interval gate). The maxsize=1 queue + drop-stale below means a
+                # busy worker just skips frames instead of backing up, so the box
+                # updates as fast as the worker can produce it.
+                if self.yolo_on:
                     try:
                         if self.yolo_in.full():
                             try:
