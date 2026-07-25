@@ -35,6 +35,8 @@ test/labels/
 
 # --- local config / credentials (per-machine, not shared) ---
 .rov_server_creds
+mailmap.txt
+repo-backup.git/
 
 # --- OS / editor junk ---
 .DS_Store
