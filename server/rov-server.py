@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
 Combined ROV server (runs on the Raspberry Pi).
-
   * receives 7-channel thruster/light UDP packets and drives the PCA9685
   * streams the camera to the client over UDP
-
 Both run on their own threads, so a camera fault never stops thruster control
 (the safety-critical loop keeps running). Reads .rov_server_creds; --wifi picks the
 wifi section. Ctrl+C neutralises and disables outputs cleanly.
@@ -19,7 +17,6 @@ import struct
 import sys
 import threading
 import time
-
 import cv2
 from pca9685 import PCA9685
 
@@ -30,17 +27,13 @@ THRUSTER_CHANNELS = range(6)
 LIGHT_CHANNEL = 9
 THR_LOOP_DT = 0.02  # 50 Hz socket timeout
 THR_TIMEOUT = 0.5  # neutral after this many seconds without packets
-
 # --- video ---
 CHUNK = 60_000  # keep UDP packets < 65507 bytes
-
 # --- sensors ---
 SENSOR_FMT = "<dff"  # (epoch_time, depth_m, yaw_deg)
-
 pca = PCA9685()
 pca.set_pwm_frequency(50)
 pca.output_enable()
-
 stop_event = threading.Event()
 
 
@@ -77,7 +70,6 @@ def thruster_loop(cfg):
     sock.bind(("", port))
     sock.settimeout(THR_LOOP_DT)
     print(f"[thrusters] listening on *:{port}")
-
     last_rx = time.time()
     fmt, size = "<7H", 14
     try:
@@ -116,12 +108,10 @@ def video_loop(cfg, mode, source, chunk, quality_override):
         if quality_override is not None
         else cfg.getint("DEFAULT", "video_quality", fallback=75)
     )
-
     cam = cv2.VideoCapture(source)
     if not cam.isOpened():
         print(f"[video] cannot open camera {source}; video disabled")
         return
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     enc = [cv2.IMWRITE_JPEG_QUALITY, quality]
     fid = 0
@@ -183,7 +173,6 @@ def sensor_loop(cfg, mode, depth_bus, saltwater, imu_bus, imu_cs):
         print(f"[sensors] config error ({e}); sensors disabled")
         return
     port = cfg.getint("DEFAULT", "imu_and_depth_port")
-
     try:
         import ms5837
 
@@ -199,13 +188,11 @@ def sensor_loop(cfg, mode, depth_bus, saltwater, imu_bus, imu_cs):
     except Exception as e:
         print(f"[sensors] depth sensor unavailable ({e}); sensors disabled")
         return
-
     heading = None
     try:
         heading = HeadingTracker(bus=imu_bus, cs=imu_cs)
     except Exception as e:
         print(f"[sensors] IMU unavailable ({e}); yaw will read 0")
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     print(f"[sensors] streaming depth+yaw to {client_ip}:{port}")
     try:
@@ -245,13 +232,10 @@ def main():
     )
     ap.add_argument("--salt", action="store_true", help="use saltwater density")
     args = ap.parse_args()
-
     mode = "wifi" if args.wifi else "lan"
     cfg = load_config()
     print(f"✓ Loaded '{mode}' settings")
-
     neutral_all()
-
     threads = [threading.Thread(target=thruster_loop, args=(cfg,), daemon=True)]
     if not args.no_video:
         threads.append(
@@ -271,7 +255,6 @@ def main():
         )
     for t in threads:
         t.start()
-
     print("Server running. Press Ctrl+C to stop.")
     try:
         while not stop_event.is_set():

@@ -10,7 +10,7 @@
   "orbit_hold_frac": 0.06,
   "orbit_surge_kp": 10.0,
   "orbit_flip_s": 6.0,
-  "grace_s": 0.5,
+  "grace_s": 0.2,
   "search_yaw_command": 0.235,
   "search_heave_command": 0.2,
   "search_heave_period_s": 4.0,

@@ -582,6 +582,17 @@ class VideoReceiver(threading.Thread):
         self.last_boxes = []
         self._auto_boxes = []  # thread-safe copy of last_boxes for the autonomy loop
         self._auto_dims = (0, 0)  # (w, h) of the last decoded frame
+        # --- perception latency instrumentation ---
+        # _box_ready_t: wall time the current box was popped from the worker, i.e.
+        #   the earliest it was available to the rest of the pipeline. A 30 Hz
+        #   consumer (UI / autonomy loop) reads it some ms later; THAT gap is the
+        #   coupling + timer delay that #2 (drain thread) and #3 (event-driven
+        #   control) would remove. It excludes inference, which #2/#3 can't touch.
+        # _det_period: smoothed seconds between successive worker results -> det Hz.
+        self._box_ready_t = 0.0
+        self._det_period = 0.0
+        self._last_pop_t = 0.0
+        self.box_event = threading.Event()  # set when a fresh box arrives (drives #3)
         if weights:
             ctx = mp.get_context("spawn")  # fresh interpreter, NOT fork
             self.yolo_in = ctx.Queue(maxsize=1)
@@ -681,6 +692,8 @@ class VideoReceiver(threading.Thread):
                         pass
                 # Pull any boxes the worker has ready (non-blocking) and cache
                 # them so they persist on-screen between inferences.
+                got_new_box = False
+                pop_t = 0.0
                 if self.yolo_on:
                     try:
                         got = self.yolo_out.get_nowait()
@@ -689,6 +702,8 @@ class VideoReceiver(threading.Thread):
                             self.yolo_on = False
                         else:
                             self.last_boxes = got
+                            got_new_box = True  # a fresh result arrived this frame
+                            pop_t = time.time()
                     except Exception:
                         pass
                     for x1, y1, x2, y2, cf in self.last_boxes:
@@ -710,6 +725,20 @@ class VideoReceiver(threading.Thread):
                     self.tag_ids = ids
                     self._auto_boxes = list(self.last_boxes)
                     self._auto_dims = (frame.shape[1], frame.shape[0])
+                    # advance the box-ready stamp + det-rate ONLY when a fresh box
+                    # actually arrived, so "box lag" measures the age of the real
+                    # detection, not the time since the last redraw.
+                    if got_new_box:
+                        if self._last_pop_t:
+                            p = pop_t - self._last_pop_t
+                            self._det_period = (
+                                p
+                                if self._det_period == 0.0
+                                else 0.9 * self._det_period + 0.1 * p
+                            )
+                        self._last_pop_t = pop_t
+                        self._box_ready_t = pop_t
+                        self.box_event.set()  # wake the event-driven control loop
             now = time.time()
             for k in [k for k, v in buffers.items() if now - v["ts"] > 0.5]:
                 del buffers[k]
@@ -753,6 +782,19 @@ class VideoReceiver(threading.Thread):
         if not fresh or not boxes:
             return None, dims
         return boxes[0], dims  # worker runs max_det=1, so one box is all there is
+
+    def get_box_lag(self):
+        """(age_ms, det_hz) for the freshest box.
+        age_ms = ms since the box left the worker (measured now, at the caller's
+        read) -- the post-inference pipeline delay #2/#3 would shave.
+        det_hz = smoothed rate at which new boxes arrive (should track video fps).
+        Returns (0.0, 0.0) until the first box has been seen."""
+        with self.lock:
+            t = self._box_ready_t
+            period = self._det_period
+        age_ms = (time.time() - t) * 1000.0 if t else 0.0
+        hz = (1.0 / period) if period > 0 else 0.0
+        return age_ms, hz
 
 
 # ---------- pygame UI ----------
@@ -849,6 +891,8 @@ class App:
         self.trig_rest = {4: -1.0, 5: -1.0}  # recalibrated when the mode is enabled
         self.joy_cmd = (0.0, 0.0, 0.0, 0.0)
         self._init_joystick()
+        self._box_lag_ms = 0.0  # smoothed display box-lag (30 Hz UI read)
+        self._ctrl_lag_ms = 0.0  # smoothed control-path box-lag (event-driven loop)
         self.status = "Ready"
         self.log = []
         self.lock = threading.Lock()
@@ -1227,6 +1271,7 @@ class App:
 
     def _stop_autonomy(self):
         self.autonomous = False
+        self._ctrl_lag_ms = 0.0  # clear the control-path readout
         for _ in range(5):
             try:
                 self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
@@ -1236,13 +1281,26 @@ class App:
         self.add_log("autonomous OFF")
 
     def _autonomy_worker(self):
-        dt_target = 1.0 / 30.0  # run the control loop at ~30 Hz
+        # Event-driven (#3): block until a fresh YOLO box arrives, then run exactly
+        # one control step on it. This removes the old fixed-30 Hz timer that kept
+        # re-sampling stale boxes (the ~31 ms "box lag"). The wait has a timeout so
+        # that if video stalls we still tick -- the sub keeps searching, stays
+        # under command (well inside the server's 0.5 s neutral watchdog), and we
+        # re-check the abort/autonomous flags. dt is real elapsed time between
+        # steps, which the strategy's timers want anyway.
+        WAIT_TIMEOUT = 0.1  # s; also the keep-alive floor when no boxes are coming
+        self.video.box_event.clear()  # don't act on a stale pre-start signal
         last = time.time()
         while self.autonomous and not self.abort:
+            self.video.box_event.wait(timeout=WAIT_TIMEOUT)
+            self.video.box_event.clear()
             now = time.time()
             dt = now - last
             last = now
             raw, (fw, fh) = self.video.get_detection()
+            # box age measured right at the control read -> this is the number #3
+            # drives down (from ~31 ms toward single digits). Shown as "ctrl lag".
+            lag_ms, _ = self.video.get_box_lag()
             if raw is not None and fw and fh:
                 x1, y1, x2, y2 = raw[:4]
                 sx, sy = 640.0 / fw, 480.0 / fh  # -> the strategy's tuning frame
@@ -1272,9 +1330,11 @@ class App:
             with self.lock:
                 self.auto_state = self.strategy.state
                 self.auto_cmd = (surge, strafe, heave, yaw)
-            rest = dt_target - (time.time() - now)
-            if rest > 0:
-                time.sleep(rest)
+                self._ctrl_lag_ms = (
+                    lag_ms
+                    if self._ctrl_lag_ms == 0.0
+                    else 0.85 * self._ctrl_lag_ms + 0.15 * lag_ms
+                )
         # left the loop -> make sure the sub is neutral
         for _ in range(3):
             try:
@@ -1684,6 +1744,28 @@ class App:
         else:
             t = self.f_status.render("NO VIDEO", True, (120, 120, 120))
             s.blit(t, t.get_rect(center=self.vid_rect.center))
+        # perception latency readout (bottom-left of the video): how stale the
+        # freshest YOLO box is by the time a 30 Hz consumer reads it -- i.e. the
+        # delay #2/#3 would remove -- plus the rate new boxes arrive. render.py's
+        # on-screen number is inference-only (~10 ms); total ~= that + box lag.
+        if self.video.yolo_on:
+            lag_ms, det_hz = self.video.get_box_lag()
+            self._box_lag_ms = (
+                lag_ms
+                if self._box_lag_ms == 0.0
+                else 0.85 * self._box_lag_ms + 0.15 * lag_ms
+            )
+            # While autonomous, show the control loop's own box age (what #3 drives
+            # down); otherwise show the 30 Hz display proxy. det is always shown.
+            if self.autonomous:
+                label, shown = "ctrl lag", self._ctrl_lag_ms
+            else:
+                label, shown = "box lag", self._box_lag_ms
+            lag_txt = f"{label} {shown:5.1f} ms   det {det_hz:4.1f} Hz"
+            s.blit(
+                self.f_small.render(lag_txt, True, (150, 200, 220)),
+                (self.vid_rect.x + 8, self.vid_rect.bottom - 24),
+            )
         if self.video.rec.on:
             s.blit(
                 self.f_small.render("\u25cf REC", True, (255, 80, 80)),

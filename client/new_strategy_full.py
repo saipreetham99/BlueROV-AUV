@@ -17,16 +17,18 @@ straight into run_sim.py and onto the real sub -- but note the added third arg:
 
 Behaviour (competition: find the other sub's TAGGED BACK and scan it):
     IDLE/SEARCHING -> ADVANCING -> ORBITING -> SCANNING, with a grace period so a
-    one-frame detection dropout doesn't flip the state. We start facing AWAY, so
-    with no target in view the sub SPINS -- yaws continuously (a full-circle scan)
-    while bobbing in depth, until a box reappears, then locks into the chase. The
-    spin turns TOWARD the side the target was last seen (exit left -> yaw left) so
-    it follows the target out; before any target is seen it spins right. Once
-    close it ORBITS at a held radius until the back's tags come into view (back_visible), reversing
-    direction if a long circle never reveals them, then holds steady in SCANNING
-    so the tags read cleanly. The actual win -- collecting enough unique tags --
-    is owned by the caller (rov_client.py), so this brain never stops on its own
-    or celebrates; it just keeps a clean view of the back until control is taken.
+    one-frame detection dropout doesn't flip the state -- and through that window
+    the sub keeps steering on the LAST known box instead of going blind. We start
+    facing AWAY, so with no target in view the sub SPINS -- yaws continuously (a
+    full-circle scan) while bobbing in depth, until a box reappears, then locks
+    into the chase. The spin turns TOWARD the side the target was last seen (exit
+    left -> yaw left) so it follows the target out; before any target is seen it
+    spins right. Once close it ORBITS at a held radius until the back's tags come
+    into view (back_visible), reversing direction if a long circle never reveals
+    them, then holds steady in SCANNING so the tags read cleanly. The actual win
+    -- collecting enough unique tags -- is owned by the caller (rov_client.py), so
+    this brain never stops on its own or celebrates; it just keeps a clean view of
+    the back until control is taken.
 
 Anti-stall: two subs each centre on the other, so each keeps its back pointed
     away -- a plain orbit counter-rotates and never gets behind an active tracker,
@@ -176,6 +178,10 @@ class Strategy:
 
         self.grace_s = 0.5  # tolerate brief detection dropouts
         self.lost_timer = 0.0
+        # last VALID box. During a brief dropout (box gone but still inside the
+        # grace window) the centering math coasts on this instead of going blind,
+        # so the sub keeps tracking where the target last was until grace expires.
+        self._last_box = BoundingBox()
 
         # --- search: spin + gentle depth sweep to scan for the target ---
         self.search_yaw_command = 0.1  # spin rate while searching (magnitude)
@@ -288,11 +294,26 @@ class Strategy:
         if box.is_valid:
             self.lost_timer = 0.0
             self.seen_target_once = True  # we've met the opponent at least once
+            self._last_box = box  # remember it to coast on during a brief dropout
             # remember the last-seen side so we can spin that way if we lose it:
             # left of centre -> turn left (-1), right of centre -> turn right (+1)
             self.search_dir = -1.0 if box.center[0] < self.center_x else 1.0
         else:
             self.lost_timer += dt
+
+        # Brief-dropout coast: box gone, still inside the grace window, and we have
+        # a last known box -> steer the centering math on that LAST box instead of
+        # going blind. `aim` is the box the centering math uses; when the live box
+        # is present it IS the live box, so this is a no-op outside the dropout
+        # window. NB: the state-switch decisions below (re-acquire in SEARCHING, and
+        # the top-level bail to SEARCHING) deliberately stay on the LIVE `box`, so
+        # we only ever change state on a real detection, never a stale one.
+        coasting = (
+            not box.is_valid
+            and self.lost_timer <= self.grace_s
+            and self._last_box.is_valid
+        )
+        aim = self._last_box if coasting else box
 
         # whole target lost longer than the grace period -> SEARCHING (spins below).
         # BUT never bail to SEARCHING while running the RESET maneuver or mid-dash:
@@ -318,7 +339,7 @@ class Strategy:
                 * self.search_phase
                 / max(self.search_heave_period_s, 1e-3)
             )
-            if box.is_valid:  # target spotted -> chase it
+            if box.is_valid:  # target spotted -> chase it (live box only: real lock)
                 self.state = "ADVANCING"
                 self.search_timer = 0.0
             else:
@@ -333,15 +354,15 @@ class Strategy:
         # ---------------- ADVANCING (close in, centred on the box) ----------------
         elif self.state == "ADVANCING":
             surge = self.advance_surge
-            if box.is_valid:
+            if aim.is_valid:  # live box, or the last box while coasting
                 # aim OFF-centre horizontally so we close in at an angle rather
                 # than nose-to-nose (head-on just parks us facing an opponent who
                 # is facing us). Vertical stays centred.
-                err_x = (self.center_x + self.approach_offset_px) - box.center[0]
-                err_y = self.center_y - box.center[1]
+                err_x = (self.center_x + self.approach_offset_px) - aim.center[0]
+                err_y = self.center_y - aim.center[1]
                 yaw = -self.yaw_kp * err_x  # +yaw = turn right -> steer toward target
                 heave = self.heave_kp * err_y
-                if box.area > self.orbit_enter_area:  # arrived -> orbit for the back
+                if aim.area > self.orbit_enter_area:  # arrived -> orbit for the back
                     self.state = "ORBITING"
                     self.orbit_no_back_timer = 0.0
                     self.stuck_timer = 0.0
@@ -366,9 +387,9 @@ class Strategy:
                     # start the vertical phase this tick (no dead frame); its
                     # direction alternates per reset via reset_heave_dir
                     heave = self.reset_heave_dir * self.reset_heave
-                elif box.is_valid:
-                    err_x = self.center_x - box.center[0]
-                    err_y = self.center_y - box.center[1]
+                elif aim.is_valid:  # live box, or the last box while coasting
+                    err_x = self.center_x - aim.center[0]
+                    err_y = self.center_y - aim.center[1]
                     yaw = (
                         -self.yaw_kp * err_x
                     )  # keep facing target -> back stays hidden
@@ -389,7 +410,7 @@ class Strategy:
                     # radius hold: nudge fwd/back to keep the box at the hold size,
                     # so the orbit holds a steady radius instead of spiralling out.
                     # +err -> box too small (too far) -> close in.
-                    area_frac = box.area / self._full
+                    area_frac = aim.area / self._full
                     surge = max(
                         -1.0,
                         min(
@@ -397,12 +418,13 @@ class Strategy:
                             self.orbit_surge_kp * (self.orbit_hold_frac - area_frac),
                         ),
                     )
-                    if box.area < self.orbit_exit_area:  # target fled -> re-chase hard
+                    if aim.area < self.orbit_exit_area:  # target fled -> re-chase hard
                         self.state = "ADVANCING"
                         self.stuck_timer = 0.0
                         self.dash_timer = 0.0
                 else:
-                    # box briefly gone: keep circling (dash speed if mid-dash)
+                    # box gone AND not coasting (grace expired mid-dash, or no last
+                    # box): keep circling open-loop (dash speed if mid-dash)
                     if self.dash_timer > 0.0:
                         self.dash_timer -= dt
                         strafe = self.orbit_dir * self.dash_strafe
@@ -453,11 +475,11 @@ class Strategy:
                 self.scan_lost_timer = 0.0
             else:
                 self.scan_lost_timer += dt
-            if box.is_valid:
+            if aim.is_valid:  # live box, or the last box while coasting
                 # only centre on the target; surge/strafe stay ~0 so the frame is
                 # steady -- a still image reads tags far faster than strafing past.
-                err_x = self.center_x - box.center[0]
-                err_y = self.center_y - box.center[1]
+                err_x = self.center_x - aim.center[0]
+                err_y = self.center_y - aim.center[1]
                 yaw = -self.yaw_kp * err_x
                 heave = self.heave_kp * err_y
             # lost the back for longer than the grace -> circle again to re-acquire
