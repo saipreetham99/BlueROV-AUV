@@ -1967,9 +1967,9 @@ def main():
     )
     ap.add_argument("--wifi", action="store_true")
     ap.add_argument(
-        "--weights", default=None, help="YOLOv8 weights to enable detection"
+        "--weights", default=None, help="YOLOv26 weights to enable detection"
     )
-    ap.add_argument("--conf", type=float, default=0.8)
+    ap.add_argument("--conf", type=float, default=0.6)
     ap.add_argument("--yolo-interval", type=int, default=3)
     ap.add_argument(
         "--strategy",
