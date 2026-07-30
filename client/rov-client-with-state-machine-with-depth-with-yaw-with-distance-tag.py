@@ -45,7 +45,7 @@ Strategy = None
 BoundingBox = None
 HAVE_STRATEGY = False
 _STRATEGY_ERR = ""
-_STRATEGY_NAME = "strategy_full"  # updated by main() to whatever --strategy picked
+_STRATEGY_NAME = "new_strategy_full"  # updated by main() to whatever --strategy picked
 
 
 def load_strategy(module_name):
@@ -69,19 +69,40 @@ GAINS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), GAINS_FILE
 PARAMS = [
     (
         "yaw_kp",
-        "Yaw kp (turn)",
+        "Yaw kp (advance/scan)",
         0.0,
         0.01,
         0.00005,
-        "How hard it turns to center the target left/right (higher = snappier).",
+        "How hard it turns to center the target left/right while CHASING or "
+        "SCANNING. Orbit has its own gain below.",
     ),
     (
         "heave_kp",
-        "Heave kp (up/down)",
+        "Heave kp (advance/scan)",
         0.0,
         0.01,
         0.00005,
-        "How hard it dives/climbs to center the target up/down (higher = faster).",
+        "How hard it dives/climbs to center the target up/down while CHASING or "
+        "SCANNING. Orbit has its own gain below.",
+    ),
+    (
+        "orbit_yaw_kp",
+        "Orbit yaw kp",
+        0.0,
+        0.01,
+        0.00005,
+        "Yaw centering gain used ONLY while ORBITING. Orbit fights the bearing "
+        "error its own strafe creates, so too high here judders left/right "
+        "instead of circling.",
+    ),
+    (
+        "orbit_heave_kp",
+        "Orbit heave kp",
+        0.0,
+        0.01,
+        0.00005,
+        "Heave centering gain used ONLY while ORBITING. Lower than the chase gain "
+        "keeps the frame steady at close range.",
     ),
     (
         "advance_surge",
@@ -278,6 +299,8 @@ PARAMS = [
 DEFAULTS = {
     "yaw_kp": 0.0003,
     "heave_kp": 0.0003,
+    "orbit_yaw_kp": 0.0003,
+    "orbit_heave_kp": 0.0003,
     "advance_surge": 0.8,
     "approach_offset_px": 80.0,
     "orbit_strafe": 0.8,
@@ -322,11 +345,19 @@ def load_gains():
         and isinstance(g.get("centering_kp"), (int, float))
     ):
         out["yaw_kp"] = out["heave_kp"] = float(g["centering_kp"])
+    # Mirror the brain's own fallback: an orbit gain absent from the file INHERITS
+    # its advance counterpart. Without this the panel would show the 0.0003 default
+    # while the brain is actually running the advance value, and the first touch of
+    # the slider would silently write the panel's wrong number to disk.
+    if not isinstance(g.get("orbit_yaw_kp"), (int, float)):
+        out["orbit_yaw_kp"] = out["yaw_kp"]
+    if not isinstance(g.get("orbit_heave_kp"), (int, float)):
+        out["orbit_heave_kp"] = out["heave_kp"]
     return out
 
 
 def fmt_gain(key, v):
-    if key in ("yaw_kp", "heave_kp"):
+    if key in ("yaw_kp", "heave_kp", "orbit_yaw_kp", "orbit_heave_kp"):
         return f"{v:.5f}"
     if key in ("search_yaw_command", "orbit_enter_frac", "orbit_hold_frac"):
         return f"{v:.3f}"
@@ -383,7 +414,7 @@ def camera_intrinsics(w, h):
 #   must go MORE POSITIVE. If it goes negative instead, set DEPTH_INCREASES_DOWN
 #   to False (that's the ONLY change needed -- everything else keys off it).
 DEPTH_INCREASES_DOWN = True  # True: deeper == larger sensor reading
-DEPTH_MARGIN = 0.10  # m: stop allowing "further past" this far before a limit
+DEPTH_MARGIN = 0.30  # m: stop allowing "further past" this far before a limit
 DEPTH_RECOVER = 0.40  # 0..1 heave used to gently climb/dive back once past a limit
 
 # ---------- depth hold (independent mode: PI loop on the depth sensor) ----------
@@ -408,15 +439,15 @@ HOLD_DEADBAND = 0.02  # m: freeze the integrator within +-2 cm so it won't hunt 
 # AMP in the packet, so tune at the AMP you'll demo with. Errors here are in
 # DEGREES (up to 180), so KP is far smaller than depth's. Depth and yaw drive
 # independent axes, so YAW HOLD can run alone or alongside DEPTH HOLD.
-YAW_HOLD_KP = 0.01  # yaw per degree of error (30 deg off -> ~0.30 yaw before AMP)
-YAW_HOLD_KI = 0.002  # yaw per degree-second of accumulated error (steady-bias trim)
+YAW_HOLD_KP = 0.018  # yaw per degree of error (30 deg off -> ~0.30 yaw before AMP)
+YAW_HOLD_KI = 0.004  # yaw per degree-second of accumulated error (steady-bias trim)
 YAW_HOLD_I_LIMIT = 0.3  # cap on the yaw the integral alone can command (anti-windup)
 YAW_HOLD_DEADBAND = 2.0  # deg: freeze the integrator within +-2 deg so it won't hunt
 # SIGN CONVENTION -- verify in the water before trusting the hold:
 #   with yaw hold OFF, push a +yaw (turn-right) command from the pad and watch the
 #   on-screen Yaw reading. If it goes UP (more positive), leave this True; if it
 #   goes DOWN, set it False (the ONLY change needed -- the loop keys off it).
-YAW_CW_IS_POSITIVE = True
+YAW_CW_IS_POSITIVE = False
 
 
 # ---------- shared thruster core (identical to pool_test.py) ----------
@@ -1408,7 +1439,8 @@ class App:
                 json.dump(data, f, indent=2)
             self._gains_dirty = False
             self.panel_status = (
-                f"saved  yaw_kp={data['yaw_kp']:.5f}  heave_kp={data['heave_kp']:.5f}"
+                f"saved  yaw {data['yaw_kp']:.5f}/{data['orbit_yaw_kp']:.5f}  "
+                f"heave {data['heave_kp']:.5f}/{data['orbit_heave_kp']:.5f}"
             )
         except OSError as e:
             self.panel_status = f"write failed: {e}"

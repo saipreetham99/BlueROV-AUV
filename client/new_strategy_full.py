@@ -55,10 +55,16 @@ Two deliberate changes vs the archive, to match the Unity sim's conventions:
     * ORBITING heave uses the SAME sign as ADVANCING (the archive negated it,
       which drove the sub the wrong way vertically while orbiting).
 
-Steering gains are SPLIT into yaw_kp (horizontal) and heave_kp (vertical) so the
-snappy turn axis and the sluggish depth axis tune independently. The physical
-thruster gains (surge/strafe/heave/yaw Gain in the sim) are a separate concern --
-tune those to match the real sub, then leave them alone.
+Steering gains are SPLIT two ways. First by AXIS -- yaw_kp (horizontal) and
+heave_kp (vertical) -- so the snappy turn axis and the sluggish depth axis tune
+independently. Then by STATE: ORBITING has its OWN pair, orbit_yaw_kp /
+orbit_heave_kp, because it centres against a continuous sideways disturbance --
+its own strafe -- that ADVANCING never sees, so it usually wants a softer gain
+than the chase does. Leave the two orbit keys out of the gains file and they
+INHERIT the advance pair, so an older file behaves exactly as it did before the
+split. (SCANNING still uses the advance pair.) The physical thruster gains
+(surge/strafe/heave/yaw Gain in the sim) are a separate concern -- tune those to
+match the real sub, then leave them alone.
 
 Tuning (single source of truth):
     Every knob lives in strategy_gains.json next to this file. It's loaded on
@@ -111,8 +117,16 @@ class Strategy:
         self.state = "IDLE"
 
         # --- defaults (archive values; overridden by strategy_gains.json if present) ---
+        # ADVANCING / SCANNING centering gains.
         self.yaw_kp = 0.0003  # steering strength, horizontal (turn)
         self.heave_kp = 0.0003  # steering strength, vertical (up/down)
+        # ORBITING gets its OWN pair. Orbit centres against a continuous sideways
+        # disturbance (its own strafe) that ADVANCING never sees, so it usually
+        # wants a softer gain: too high here and it judders left/right instead of
+        # circling. Absent from the gains file -> inherits the pair above, so an
+        # old file behaves exactly as it did before this split.
+        self.orbit_yaw_kp = self.yaw_kp
+        self.orbit_heave_kp = self.heave_kp
         self.advance_surge = 0.8  # forward speed while chasing
         # ADVANCING closes in at an ANGLE, not head-on: hold the target this many
         # pixels off-centre (positive = right of centre -> approach from its left).
@@ -223,6 +237,10 @@ class Strategy:
         base_h = legacy if legacy is not None else self.heave_kp
         self.yaw_kp = num("yaw_kp", base_y)
         self.heave_kp = num("heave_kp", base_h)
+        # ORBITING's own pair. Missing key -> inherit the advance gain just loaded,
+        # so a gains file written before this split still behaves identically.
+        self.orbit_yaw_kp = num("orbit_yaw_kp", self.yaw_kp)
+        self.orbit_heave_kp = num("orbit_heave_kp", self.heave_kp)
 
         self.advance_surge = num("advance_surge", self.advance_surge)
         self.approach_offset_px = num("approach_offset_px", self.approach_offset_px)
@@ -277,7 +295,9 @@ class Strategy:
             self._load_gains()
             print(
                 f"[strategy] gains reloaded (yaw_kp={self.yaw_kp:.4g}, "
-                f"heave_kp={self.heave_kp:.4g})"
+                f"heave_kp={self.heave_kp:.4g}, "
+                f"orbit_yaw_kp={self.orbit_yaw_kp:.4g}, "
+                f"orbit_heave_kp={self.orbit_heave_kp:.4g})"
             )
 
     def update(self, box: BoundingBox, dt: float, back_visible: bool = False):
@@ -390,17 +410,20 @@ class Strategy:
                 elif aim.is_valid:  # live box, or the last box while coasting
                     err_x = self.center_x - aim.center[0]
                     err_y = self.center_y - aim.center[1]
+                    # ORBIT's OWN centering gains -- NOT yaw_kp / heave_kp. Orbit
+                    # fights the bearing error its own strafe creates, so this pair
+                    # is normally softer than the chase pair.
                     yaw = (
-                        -self.yaw_kp * err_x
+                        -self.orbit_yaw_kp * err_x
                     )  # keep facing target -> back stays hidden
-                    heave = self.heave_kp * err_y  # same sign as ADVANCING
+                    heave = self.orbit_heave_kp * err_y  # same sign as ADVANCING
 
                     # strafe sideways to circle. NORMALLY ease off when badly
                     # off-centre; during a DASH hold full strafe and skip the ease,
                     # to whip around faster than the opponent can re-face us.
                     if self.dash_timer > 0.0:
                         self.dash_timer -= dt
-                        strafe = self.orbit_dir * self.dash_strafe
+                        strafe = -self.orbit_dir * self.dash_strafe
                     else:
                         scale = max(
                             0.0, 1.0 - abs(err_x) / self.max_yaw_error_for_strafe
@@ -478,6 +501,8 @@ class Strategy:
             if aim.is_valid:  # live box, or the last box while coasting
                 # only centre on the target; surge/strafe stay ~0 so the frame is
                 # steady -- a still image reads tags far faster than strafing past.
+                # NB: still on the ADVANCE pair, not the orbit pair -- nothing is
+                # strafing here, so there's no self-made disturbance to soften for.
                 err_x = self.center_x - aim.center[0]
                 err_y = self.center_y - aim.center[1]
                 yaw = -self.yaw_kp * err_x
