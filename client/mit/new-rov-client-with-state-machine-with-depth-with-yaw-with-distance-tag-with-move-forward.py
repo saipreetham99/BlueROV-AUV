@@ -5,16 +5,28 @@ Combined topside ROV client (single pygame window):
     DOF at a fixed level for a fixed duration through the SAME mix/packet as the driver,
     then neutral. STOP aborts. Same engine as pool_test.py / real_test_gui.py.
   * Manual gamepad control (JOYSTICK button): left stick Y surge, right stick Y strafe,
-    RT heave up / right-stick-X-left heave down, XBOX/BACK yaw, D-pad amp +/-100,
+    RT heave up / right-stick-X-left heave down, XBOX/BACK yaw, D-pad throttle,
     X light, B tag-flash. Live whenever autonomy is off. Same mix/packet path.
+  * Depth hold + yaw hold (independent PI loops). With BOTH holding, the latched
+    FORWARD button pushes straight ahead AND logs depth/yaw against their targets
+    to forward_hold_*.csv for tolerance verification.
   * Live video (shown inside the window when the stream is up; "NO VIDEO" otherwise),
     with AprilTag (optional) and YOLO (optional, --weights) overlays and a RECORD button
     that saves the clean stream to mp4.
+  * Always-on logging, running in every mode from launch to quit:
+      - telemetry_log_*.csv   10 Hz rows of depth/yaw + throttle % + mode +
+                              commands, with a row per AprilTag on every detection.
+      - rov_log_*.mcap        the same telemetry, every detection, a plain-text
+                              event stream, and the annotated video frame grabbed
+                              the moment the LEDs start flashing. Foxglove JSON
+                              schemas -- open in Foxglove Studio or the mcap CLI.
+                              Needs `pip install mcap`; without it flash frames
+                              fall back to .jpg files and the CSVs still run.
 Mode (lan/wifi) is chosen at launch with --wifi and applies to both video and thrusters.
 Reads .rov_server_creds.
   python rov_client.py
-  python rov_client.py --wifi --weights best.pt
-  python rov_client.py --weights best.pt --strategy aqua_strategy
+  python rov_client.py --wifi --weights mit.pt
+  python rov_client.py --weights mit.pt --strategy aqua_strategy
 """
 
 import argparse
@@ -26,12 +38,14 @@ import json
 
 # cv2 and pygame both ship SDL2; allow the duplicate class registration quietly.
 os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+import base64
+import signal
 import socket
 import struct
 import sys
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
 import cv2
 import numpy as np
@@ -382,7 +396,28 @@ LIGHT_ON = 1900
 SENSOR_FMT = "<dff"  # (epoch_time, depth_m, yaw_deg) - matches rov_server.py
 AMP_MIN = 0
 AMP_MAX = 400
+# THROTTLE is the only speed number the UI and the logs ever show: 0 % leaves the
+# thrusters at neutral, 100 % is AMP_FULL_SCALE. AMP is purely the packet's
+# internal unit -- the +-microsecond swing from NEUTRAL a full-scale (+-1.0)
+# command is worth -- and never reaches the screen or a log file. The mapping is
+# a plain linear scale, so amp == throttle_pct / 100 * AMP_FULL_SCALE recovers it
+# if anyone ever needs the raw number back.
+AMP_FULL_SCALE = 400.0
+THROTTLE_DEFAULT = 30.0  # % the client starts at (120 amp internally)
 JOY_DEADZONE = 0.12  # ignore small stick drift around center
+
+
+def amp_percent(amp):
+    """Packet AMP -> throttle percent (0 amp -> 0 %, 400 -> 100 %)."""
+    if AMP_FULL_SCALE <= 0:
+        return 0.0
+    return 100.0 * float(amp) / AMP_FULL_SCALE
+
+
+def amp_from_percent(pct):
+    """Throttle percent -> packet AMP, clamped to the legal range."""
+    return max(AMP_MIN, min(AMP_MAX, int(round(float(pct) / 100.0 * AMP_FULL_SCALE))))
+
 
 # ---------- AprilTag distance / pose ----------
 # These are the knobs you change when the tag or the lens changes. TAG_SIZE_M is
@@ -390,9 +425,25 @@ JOY_DEADZONE = 0.12  # ignore small stick drift around center
 TAG_SIZE_M = 0.03145  # 31.45 mm: outer edge of the tag's BLACK square (see steps)
 TAG_CELL_M = 0.00912  # 9.12 mm: one module/cell (reference only; NOT used in math)
 CAMERA_HFOV_DEG = 110.0  # BlueROV2 low-light lens ~110 deg in air (tune -- see steps)
-DIST_SCALE = 4.63  # single calibration knob: set = true_metres / measured_reading @1m
+DIST_SCALE = 2.43  # single calibration knob: set = true_metres / measured_reading @1m
 TAG_NEAR_M = 1.0  # a tag counts as "close" (light may flash) under this distance
-TAG_LOG_ENABLED = True  # write apriltag_log_*.csv of every detection (id, dist, time)
+
+# ---------- always-on logging ----------
+# Both logs start at launch and run in EVERY mode (idle, test, joystick, holds,
+# autonomy) until the window closes -- there is no record button for them.
+TELEM_LOG_ENABLED = True  # telemetry_log_*.csv: 10 Hz depth/yaw/thrust/tags
+TELEM_LOG_HZ = 10.0  # tick rate of that log (detections add extra rows)
+MCAP_LOG_ENABLED = True  # rov_log_*.mcap: same data + the flash video frames
+# An .mcap only becomes readable when finish() writes its index/summary, and a
+# chunked writer holds messages in RAM until a chunk fills -- so a process that
+# is killed rather than closed can leave a file Foxglove reports as EMPTY.
+# Chunking off means every message record hits the stream immediately: no
+# compression, a somewhat bigger file, but a hard kill loses almost nothing and
+# `mcap recover` can rebuild what's there. Flip to True if size matters more.
+MCAP_USE_CHUNKING = False
+MCAP_CHUNK_SIZE = 65536  # bytes per chunk when chunking IS on (default is ~768k)
+MCAP_FLUSH_S = 1.0  # push the OS file buffer to disk at most this often
+FLASH_JPEG_QUALITY = 85  # quality of the frame stored on each flash episode
 
 
 def camera_intrinsics(w, h):
@@ -423,9 +474,9 @@ DEPTH_RECOVER = 0.40  # 0..1 heave used to gently climb/dive back once past a li
 # trims the steady offset from buoyancy (this sub floats up, so I settles at a
 # small DOWN bias). No D term on purpose -- the depth sensor is noisy and water
 # drag already damps things; add one only if it oscillates. All heave output is
-# scaled by AMP in the packet, so these gains are relative to AMP: tune them at
-# the AMP you'll actually demo with. Start here and adjust.
-HOLD_KP = 2.0  # heave per metre of error (0.3 m off -> ~0.45 heave before AMP)
+# scaled by the THROTTLE setting, so these gains are relative to it: tune them at
+# the throttle you'll actually demo with. Start here and adjust.
+HOLD_KP = 2.0  # heave per metre of error (0.3 m off -> ~0.45 heave, pre-throttle)
 HOLD_KI = 0.4  # heave per metre-second of accumulated error (buoyancy trim)
 HOLD_I_LIMIT = 0.5  # cap on the heave the integral alone can command (anti-windup)
 HOLD_DEADBAND = 0.02  # m: freeze the integrator within +-2 cm so it won't hunt on noise
@@ -436,10 +487,10 @@ HOLD_DEADBAND = 0.02  # m: freeze the integrator within +-2 cm so it won't hunt 
 # heading is, I trims a steady bias (e.g. a tether pull). No D term. Yaw is
 # circular, so the error is the SHORTEST signed angle (wrapped to +-180 deg): at
 # 179 deg off it turns the short 1-deg way, not most of a lap. Output is scaled by
-# AMP in the packet, so tune at the AMP you'll demo with. Errors here are in
+# the THROTTLE setting, so tune at the throttle you'll demo with. Errors are in
 # DEGREES (up to 180), so KP is far smaller than depth's. Depth and yaw drive
 # independent axes, so YAW HOLD can run alone or alongside DEPTH HOLD.
-YAW_HOLD_KP = 0.018  # yaw per degree of error (30 deg off -> ~0.30 yaw before AMP)
+YAW_HOLD_KP = 0.018  # yaw per degree of error (30 deg off -> ~0.30 yaw, pre-throttle)
 YAW_HOLD_KI = 0.004  # yaw per degree-second of accumulated error (steady-bias trim)
 YAW_HOLD_I_LIMIT = 0.3  # cap on the yaw the integral alone can command (anti-windup)
 YAW_HOLD_DEADBAND = 2.0  # deg: freeze the integrator within +-2 deg so it won't hunt
@@ -448,6 +499,19 @@ YAW_HOLD_DEADBAND = 2.0  # deg: freeze the integrator within +-2 deg so it won't
 #   on-screen Yaw reading. If it goes UP (more positive), leave this True; if it
 #   goes DOWN, set it False (the ONLY change needed -- the loop keys off it).
 YAW_CW_IS_POSITIVE = False
+
+# ---------- forward-while-holding ----------
+# With DEPTH+YAW hold both running, the sub can also be pushed FORWARD only:
+# the left stick (pull-back ignored) or the latched FORWARD button. Strafe stays
+# 0 and the PI loops keep heave/yaw, so it translates while tracking depth and
+# heading. Speed is the THROTTLE setting, so set that before you press FORWARD.
+HOLD_FWD_SURGE = 1.0  # latched-button surge (0..1), scaled by the throttle
+# Tolerance log: while FORWARD is LATCHED the client writes one CSV per push,
+#   forward_hold_<stamp>_depth<target>m_yaw<target>deg_amp<amp>.csv
+# holding the tared depth/yaw from the IMU/depth sensor, their targets and errors,
+# the commands going into the mixer, and the throttle percentage --
+# i.e. exactly what you need to show how well the holds tracked while translating.
+FWD_LOG_HZ = 10.0  # rows per second in that CSV (0 = one row per control tick)
 
 
 # ---------- shared thruster core (identical to pool_test.py) ----------
@@ -595,6 +659,279 @@ class Recorder:
             self.writer = None
 
 
+# ---------- MCAP logging (Foxglove JSON schemas) ----------
+# One .mcap holds everything the client knows: 10 Hz telemetry, every AprilTag
+# detection (with the IMU + thruster reading taken alongside it), a plain-text
+# event stream, and the annotated frame grabbed when the LEDs start flashing.
+# The messages are JSON with JSON-Schema definitions -- NOT ROS 2 messages -- so
+# nothing here needs a ROS install: open the file in Foxglove Studio, or read it
+# with the `mcap` CLI / python API. Requires `pip install mcap` (and optionally
+# `zstandard` for compression). If the import fails the client still runs: the
+# CSVs are unaffected and flash frames fall back to .jpg files on disk.
+try:
+    from mcap.writer import Writer as _McapWriter
+
+    HAVE_MCAP = True
+    _MCAP_ERR = ""
+except Exception as _e:  # noqa: BLE001 - package absent -> jpg fallback
+    _McapWriter = None
+    HAVE_MCAP = False
+    _MCAP_ERR = str(_e)
+
+_TIME_SCHEMA = {
+    "type": "object",
+    "title": "time",
+    "properties": {"sec": {"type": "integer"}, "nsec": {"type": "integer"}},
+}
+_TAG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "id": {"type": "integer"},
+        "distance_m": {"type": ["number", "null"]},
+        "under_1m": {"type": "boolean"},
+    },
+}
+# Foxglove renders two schema NAMES natively: "foxglove.CompressedImage" in the
+# Image panel and "foxglove.Log" in the Log panel. Keep those names exact. The
+# rov.* schemas are ours and show up in the Plot / Raw Messages / Table panels.
+MCAP_SCHEMAS = {
+    "foxglove.CompressedImage": {
+        "type": "object",
+        "properties": {
+            "timestamp": _TIME_SCHEMA,
+            "frame_id": {"type": "string"},
+            "data": {"type": "string", "contentEncoding": "base64"},
+            "format": {"type": "string"},
+        },
+    },
+    "foxglove.Log": {
+        "type": "object",
+        "properties": {
+            "timestamp": _TIME_SCHEMA,
+            "level": {"type": "integer"},
+            "message": {"type": "string"},
+            "name": {"type": "string"},
+            "file": {"type": "string"},
+            "line": {"type": "integer"},
+        },
+    },
+    "rov.Telemetry": {
+        "type": "object",
+        "properties": {
+            "timestamp": {"type": "number"},
+            "seq": {"type": "integer"},
+            "elapsed_s": {"type": "number"},
+            "depth_m": {"type": ["number", "null"]},
+            "yaw_deg": {"type": ["number", "null"]},
+            "depth_raw_m": {"type": ["number", "null"]},
+            "yaw_raw_deg": {"type": ["number", "null"]},
+            "sensors_ok": {"type": "boolean"},
+            "throttle_pct": {"type": "number"},
+            "mode": {"type": "string"},
+            "surge": {"type": "number"},
+            "strafe": {"type": "number"},
+            "heave": {"type": "number"},
+            "yaw": {"type": "number"},
+            "depth_target_m": {"type": ["number", "null"]},
+            "yaw_target_deg": {"type": ["number", "null"]},
+            "light_pwm": {"type": "integer"},
+            "led_flashing": {"type": "boolean"},
+            "tag_count": {"type": "integer"},
+            "tags": {"type": "array", "items": _TAG_SCHEMA},
+            "flash_frame": {"type": "string"},
+        },
+    },
+    "rov.AprilTagDetection": {
+        "type": "object",
+        "properties": {
+            "timestamp": {"type": "number"},
+            "det_seq": {"type": "integer"},
+            "det_age_ms": {"type": "number"},
+            "count": {"type": "integer"},
+            "tags": {"type": "array", "items": _TAG_SCHEMA},
+            "depth_m": {"type": ["number", "null"]},
+            "yaw_deg": {"type": ["number", "null"]},
+            "sensors_ok": {"type": "boolean"},
+            "throttle_pct": {"type": "number"},
+            "mode": {"type": "string"},
+            "led_flashing": {"type": "boolean"},
+        },
+    },
+}
+MCAP_TOPICS = {
+    "/telemetry": "rov.Telemetry",
+    "/apriltags": "rov.AprilTagDetection",
+    "/camera/flash_frame": "foxglove.CompressedImage",
+    "/events": "foxglove.Log",
+}
+
+
+def _fg_time(t):
+    """Epoch seconds -> Foxglove {sec, nsec}."""
+    sec = int(t)
+    return {"sec": sec, "nsec": int(round((t - sec) * 1e9))}
+
+
+def _num(v, p):
+    """CSV field for a maybe-None number: blank rather than a faked 0."""
+    return "" if v is None else f"{v:.{p}f}"
+
+
+def _round(v, p):
+    """round() that passes None straight through (-> JSON null in the bag), so a
+    missing reading stays visibly missing instead of becoming 0.0."""
+    return None if v is None else round(float(v), p)
+
+
+class McapLogger:
+    """Thread-safe writer for the single .mcap. Every method is a no-op when the
+    package is missing or the file failed to open (self.ok stays False), so call
+    sites never have to guard. Writes come from the UI thread (telemetry, frames)
+    and from worker threads (events via add_log), hence the lock."""
+
+    def __init__(self, path):
+        self.path = path
+        self.ok = False
+        self.msgs = 0
+        self.images = 0
+        self.err = "" if HAVE_MCAP else _MCAP_ERR
+        self._lock = threading.Lock()
+        self._f = None
+        self._w = None
+        self._chan = {}
+        self._seq = defaultdict(int)
+        self._last_flush = 0.0
+        if not HAVE_MCAP:
+            print(f"[mcap] package not available ({_MCAP_ERR}) - jpg fallback")
+            return
+        try:
+            from mcap.writer import CompressionType
+
+            try:  # zstd is a separate package; fall back to an uncompressed file
+                import zstandard  # noqa: F401
+
+                comp = CompressionType.ZSTD
+            except ImportError:
+                comp = CompressionType.NONE
+            self._f = open(path, "wb")
+            self._w = _McapWriter(
+                self._f,
+                compression=comp,
+                chunk_size=MCAP_CHUNK_SIZE,
+                use_chunking=MCAP_USE_CHUNKING,
+            )
+            self._w.start(profile="", library="rov_client")
+            for topic, sname in MCAP_TOPICS.items():
+                sid = self._w.register_schema(
+                    name=sname,
+                    encoding="jsonschema",
+                    data=json.dumps(MCAP_SCHEMAS[sname]).encode("utf-8"),
+                )
+                self._chan[topic] = self._w.register_channel(
+                    topic=topic, message_encoding="json", schema_id=sid
+                )
+            self.ok = True
+            how = (
+                f"compression {comp.name.lower()}" if MCAP_USE_CHUNKING else "unchunked"
+            )
+            print(f"[mcap] logging -> {path}  ({how})")
+        except Exception as e:  # noqa: BLE001 - never take the client down
+            self.err = str(e)
+            print(f"[mcap] disabled ({e}) - jpg fallback")
+            self._close_file()
+
+    def write(self, topic, msg, t=None):
+        """Append one JSON message. A write failure disables the logger rather
+        than raising into the control loop."""
+        if not self.ok:
+            return
+        t = time.time() if t is None else t
+        ns = int(t * 1e9)
+        with self._lock:
+            try:
+                self._w.add_message(
+                    channel_id=self._chan[topic],
+                    log_time=ns,
+                    publish_time=ns,
+                    sequence=self._seq[topic],
+                    data=json.dumps(msg).encode("utf-8"),
+                )
+                self._seq[topic] += 1
+                self.msgs += 1
+                # Push the OS buffer out about once a second. finish() is what
+                # makes the file properly readable, but if we're killed before
+                # that, everything flushed here is still on disk and recoverable
+                # with `mcap recover`.
+                if t - self._last_flush >= MCAP_FLUSH_S:
+                    self._last_flush = t
+                    self._f.flush()
+            except Exception as e:  # noqa: BLE001
+                self.err = str(e)
+                self.ok = False
+                print(f"[mcap] write failed ({e}) - logging off")
+
+    def write_image(self, jpeg, t, frame_id="camera"):
+        """One JPEG as foxglove.CompressedImage (base64 in JSON encoding)."""
+        self.write(
+            "/camera/flash_frame",
+            {
+                "timestamp": _fg_time(t),
+                "frame_id": frame_id,
+                "data": base64.b64encode(jpeg).decode("ascii"),
+                "format": "jpeg",
+            },
+            t,
+        )
+        if self.ok:
+            self.images += 1
+
+    def event(self, message, level=2, t=None):
+        """One line on /events (foxglove.Log; level 2 = info, 3 = warn)."""
+        t = time.time() if t is None else t
+        self.write(
+            "/events",
+            {
+                "timestamp": _fg_time(t),
+                "level": int(level),
+                "message": str(message),
+                "name": "rov_client",
+                "file": "",
+                "line": 0,
+            },
+            t,
+        )
+
+    def _close_file(self):
+        if self._f is not None:
+            try:
+                self._f.close()
+            except OSError:
+                pass
+            self._f = None
+
+    def close(self):
+        """Finish the file (writes the index/summary -- skipping this leaves an
+        unreadable bag), then report what landed in it."""
+        with self._lock:
+            if self._w is not None and self.ok:
+                try:
+                    self._w.finish()
+                except Exception as e:  # noqa: BLE001
+                    print(f"[mcap] finish failed ({e})")
+            self.ok = False
+            self._w = None
+            self._close_file()
+        if self.msgs:
+            try:
+                kb = os.path.getsize(self.path) / 1024.0
+            except OSError:
+                kb = 0.0
+            print(
+                f"[mcap] saved {self.path}  {self.msgs} msgs, "
+                f"{self.images} frames, {kb:.0f} KB"
+            )
+
+
 import multiprocessing as mp
 
 
@@ -609,6 +946,7 @@ def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
         from ultralytics import YOLO
 
         model = YOLO(weights)
+        print(f"[yolo] device={model.device}")
     except Exception as e:
         # Report and exit; parent keeps running with video-only.
         try:
@@ -641,7 +979,7 @@ def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
 
 
 class VideoReceiver(threading.Thread):
-    def __init__(self, server_ip, port, weights="best.pt", conf=0.65, yolo_interval=3):
+    def __init__(self, server_ip, port, weights="mit.pt", conf=0.65, yolo_interval=3):
         super().__init__(daemon=True)
         self.server_ip = server_ip
         self.port = port
@@ -664,23 +1002,13 @@ class VideoReceiver(threading.Thread):
         # per-tag distance (metres): id -> dist, published for the UI + light gate.
         self.tag_dists = {}
         self._last_tag_dists = {}  # working copy, filled during a detection frame
-        # set by App every frame: True while the light is in flash/blink mode,
-        # so the tag CSV can record when the LEDs actually flashed.
-        self.led_flashing = False
-        # open a CSV logging EVERY detection (all modes): id, distance, timestamps
-        self.tag_log = None
-        if TAG_LOG_ENABLED:
-            fn = f"apriltag_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
-            try:
-                self.tag_log = open(fn, "w")
-                self.tag_log.write(
-                    "t_epoch,iso_time,tag_id,distance_m,under_1m,led_flashed\n"
-                )
-                self.tag_log.flush()
-                print(f"[tags] logging detections -> {fn}")
-            except OSError as e:
-                print(f"[tags] log open failed ({e}) - logging off")
-                self.tag_log = None
+        # Detection EVENTS, queued for the topside logger. The log lives in App
+        # (it needs the depth/yaw/thruster state this thread can't see), but it
+        # polls at 10 Hz while the detector can run faster, so publishing an event
+        # per cycle here means no detection is ever missed between polls. App
+        # drains this with drain_detections(); the deque bounds it if it doesn't.
+        self.det_seq = 0
+        self.det_events = deque(maxlen=256)
         # AprilTag detect() is CPU-heavy; run it every Nth frame (not every frame)
         # so it can't throttle the YOLO/box path. Between detections we reuse and
         # redraw the last result, so tag_ids stays populated for the mission
@@ -790,23 +1118,23 @@ class VideoReceiver(threading.Thread):
                         self._last_tag_ids.append(tid)
                         if dist is not None:
                             self._last_tag_dists[tid] = dist
-                    # log EVERY detection this cycle (all modes).
-                    #   under 1 m: full row (id, distance, under_1m=1) plus whether
-                    #     the LEDs were flashing when it was logged.
-                    #   over 1 m / unknown range: id + timestamp only, rest blank.
-                    if self.tag_log is not None and self._last_tag_hits:
-                        t_epoch = time.time()
-                        iso = datetime.now().isoformat(timespec="milliseconds")
-                        led = 1 if self.led_flashing else 0
-                        for _p, _c, tid, dist in self._last_tag_hits:
-                            near = dist is not None and dist < TAG_NEAR_M
-                            if near:
-                                self.tag_log.write(
-                                    f"{t_epoch:.4f},{iso},{tid},{dist:.4f},1,{led}\n"
+                    # Publish this cycle as ONE detection event (id + range for
+                    # every tag seen). App stamps it with depth/yaw/thruster % and
+                    # writes it to both logs, so every detection carries the IMU
+                    # and throttle state it happened under.
+                    if self._last_tag_hits:
+                        with self.lock:
+                            self.det_seq += 1
+                            self.det_events.append(
+                                (
+                                    time.time(),
+                                    self.det_seq,
+                                    [
+                                        (tid, dist)
+                                        for _p, _c, tid, dist in self._last_tag_hits
+                                    ],
                                 )
-                            else:
-                                self.tag_log.write(f"{t_epoch:.4f},{iso},{tid},,,\n")
-                        self.tag_log.flush()
+                            )
                 ids = self._last_tag_ids
                 # redraw the cached tags every frame (cheap) so the overlay stays
                 # smooth even on the frames we skip detection. green == within
@@ -903,7 +1231,6 @@ class VideoReceiver(threading.Thread):
         sock.close()
         self.rec.stop()
         self._stop_yolo()
-        self._close_tag_log()
 
     def _stop_yolo(self):
         if self.yolo_proc is None:
@@ -931,13 +1258,13 @@ class VideoReceiver(threading.Thread):
         with self.lock:
             return list(self.tag_ids)
 
-    def _close_tag_log(self):
-        if self.tag_log is not None:
-            try:
-                self.tag_log.close()
-            except Exception:
-                pass
-            self.tag_log = None
+    def drain_detections(self):
+        """Pop every detection cycle seen since the last call, oldest first:
+        [(t_epoch, det_seq, [(tag_id, distance_m or None), ...]), ...]."""
+        with self.lock:
+            out = list(self.det_events)
+            self.det_events.clear()
+        return out
 
     def get_tag_dists(self):
         """id -> distance (m) for the tags in the freshest detection."""
@@ -1039,11 +1366,12 @@ class App:
         self.f_status = pygame.font.SysFont("Helvetica", 20, bold=True)
         # thruster-test settings/state
         self.duration = 3
-        self.amp = 100
-        # AMP is a click-to-type text box now (clamped AMP_MIN..AMP_MAX on commit).
-        self.amp_rect = pygame.Rect(200, 90, 130, 36)
-        self.amp_text = str(self.amp)
-        self.amp_active = False
+        # Speed is typed and shown as THROTTLE % everywhere; self.amp is only the
+        # packet unit that percentage converts to, and is never displayed.
+        self.amp = amp_from_percent(THROTTLE_DEFAULT)
+        self.thr_rect = pygame.Rect(200, 90, 130, 36)
+        self.thr_text = f"{THROTTLE_DEFAULT:.1f}"
+        self.thr_active = False
         # "Tags to finish": unique-AprilTag target, click-to-type box.
         self.tag_target = 2
         self.target_rect = pygame.Rect(372, 552, 46, 36)
@@ -1085,6 +1413,18 @@ class App:
         self.yaw_target_active = False
         self.yaw_target_rect = pygame.Rect(440, 736, 70, 32)
         self._yaw_hold_i = 0.0
+        # FORWARD while holding: latched full surge (button) and/or forward-only
+        # stick. Cleared by STOP and by either hold turning off.
+        self.hold_forward = False
+        self.hold_surge = 0.0
+        # FORWARD tolerance log: a CSV of depth/yaw vs their targets, opened when
+        # the FORWARD latch goes ON and closed when it goes OFF (or a hold drops,
+        # or STOP). _fwd_stats accumulates mean/max |error| for the summary line.
+        self._fwd_log = None
+        self._fwd_log_name = None
+        self._fwd_log_t0 = 0.0
+        self._fwd_log_last = 0.0
+        self._fwd_stats = None
         self.capture = False
         self.rate = 50.0
         # light state
@@ -1120,6 +1460,26 @@ class App:
         self.log = []
         self.lock = threading.Lock()
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # --- always-on logging (both start now and run until the window closes) ---
+        # mcap must exist before anything can call add_log(), which mirrors every
+        # UI log line onto the bag's /events topic.
+        self.mcap = None
+        self._shutdown_done = False  # shutdown() is called from two places
+        self._telem_csv = None
+        self._telem_name = None
+        self._telem_seq = 0
+        self._telem_t0 = time.time()
+        self._telem_last = 0.0
+        self._test_label = ""  # motion label while a thruster test runs
+        self.test_cmd = (0.0, 0.0, 0.0, 0.0)  # what that test is commanding
+        self._flash_prev = False  # previous is_flashing(), for edge detection
+        self._flash_count = 0  # flash episodes so far this session
+        self._flash_dir = None  # jpg fallback directory (made on first use)
+        self._pending_flash = None  # frame id to stamp on the next telemetry row
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        if MCAP_LOG_ENABLED:
+            self.mcap = McapLogger(f"rov_log_{stamp}.mcap")
+        self._start_telem_log(stamp)
         # video
         self.video = VideoReceiver(
             self.rov_ip, self.video_port, weights, conf, yolo_interval
@@ -1145,7 +1505,7 @@ class App:
         self.buttons.append(
             Button((120, 90, 36, 36), "+", lambda: self.set_dur(+1), (80, 80, 90), idle)
         )
-        # (AMP steppers removed -- AMP is now the text box at self.amp_rect)
+        # (speed is the THROTTLE % text box at self.thr_rect, not a stepper)
         self.buttons.append(
             Button(
                 (20, 135, 316, 32),
@@ -1190,8 +1550,8 @@ class App:
         )
         self.status_y = stop_y + 66
         # manual gamepad: L-stick Y surge, R-stick Y strafe, RT heave up /
-        # R-stick X-left heave down, XBOX/BACK yaw, D-pad amp +/-100, X light,
-        # B tag-flash.
+        # R-stick X-left heave down, XBOX/BACK yaw, D-pad throttle +/-25 %,
+        # X light, B tag-flash.
         self.buttons.append(
             Button(
                 (20, 645, 316, 46),
@@ -1212,6 +1572,23 @@ class App:
                         and not self.yaw_hold
                     )
                 ),
+            )
+        )
+        # FORWARD: drive straight ahead while BOTH holds run, until STOP.
+        # Speed = THROTTLE, so set that first. Press again to stop pushing and go
+        # back to station-keeping without dropping the holds. While latched it
+        # also writes the depth/yaw tolerance CSV (see _start_fwd_log).
+        self.buttons.append(
+            Button(
+                (20, 700, 316, 46),
+                lambda: (
+                    "FORWARD: ON (logging)"
+                    if self.hold_forward
+                    else "FORWARD (hold both)"
+                ),
+                self.toggle_hold_forward,
+                (110, 130, 70),
+                lambda: self.hold_forward or (self.depth_hold and self.yaw_hold),
             )
         )
         # video record button (below the video panel)
@@ -1371,6 +1748,11 @@ class App:
                 f"[autonomy] {_STRATEGY_NAME} not importable ({_STRATEGY_ERR}); "
                 "autonomous mode disabled"
             )
+
+    # ---- throttle: the one speed number the UI and both logs use ----
+    def throttle_pct(self):
+        """Current speed as a throttle percentage (0 .. 100)."""
+        return amp_percent(self.amp)
 
     # ---- tune panel: sliders write strategy_gains.json (brain hot-reloads it) ----
     def toggle_panel(self):
@@ -1568,7 +1950,7 @@ class App:
         self._auto_thread = threading.Thread(target=self._autonomy_worker, daemon=True)
         self._auto_thread.start()
         self.set_status(">>> AUTONOMOUS - chase & orbit")
-        self.add_log(f"autonomous ON  (amp={self.amp})")
+        self.add_log(f"autonomous ON  (throttle {self.throttle_pct():.1f}%)")
 
     def _stop_autonomy(self):
         self.autonomous = False
@@ -1683,7 +2065,7 @@ class App:
         self.trig_rest[2] = self.joy.get_axis(2)
         self.joystick_on = True
         self.set_status(">>> JOYSTICK - manual control")
-        self.add_log(f"joystick ON  (amp={self.amp})")
+        self.add_log(f"joystick ON  (throttle {self.throttle_pct():.1f}%)")
 
     def _stop_joystick(self):
         self.joystick_on = False
@@ -1747,23 +2129,22 @@ class App:
     def set_dur(self, d):
         self.duration = max(1, min(15, self.duration + d))
 
-    # ---- AMP text box ----
-    def amp_editable(self):
-        """Editable except during a thruster test. The autonomy worker reads AMP
-        every loop, so it can be tuned live during a hunt."""
+    # ---- THROTTLE text box (percent) ----
+    def throttle_editable(self):
+        """Editable except during a thruster test. Every driving path re-reads the
+        throttle each loop, so it can be retyped live during a hunt or a hold."""
         return not self.running
 
-    def commit_amp(self):
-        """Parse the typed text, clamp to AMP_MIN..AMP_MAX, and deactivate the box.
-        Empty or non-numeric input falls back to the current amp."""
-        try:
-            v = int(self.amp_text)
-        except (ValueError, TypeError):
-            v = self.amp
-        v = max(AMP_MIN, min(AMP_MAX, v))
-        self.amp = v
-        self.amp_text = str(v)
-        self.amp_active = False
+    def commit_throttle(self):
+        """Parse the typed percentage, clamp to 0-100, convert to the packet's AMP
+        units and deactivate the box. Empty or non-numeric input falls back to the
+        current value. The box then re-displays what AMP can actually hit -- AMP is
+        an integer, so the reachable grid is 0.25 % steps."""
+        v = self._parse_float(self.thr_text, self.throttle_pct())
+        v = max(0.0, min(100.0, v))
+        self.amp = amp_from_percent(v)
+        self.thr_text = f"{self.throttle_pct():.1f}"
+        self.thr_active = False
 
     # ---- depth safety envelope ----
     def effective_depth(self):
@@ -1853,6 +2234,8 @@ class App:
 
     def _stop_depth_hold(self):
         self.depth_hold = False
+        self.hold_forward = False  # FORWARD needs BOTH holds -> drop the latch
+        self._stop_fwd_log()  # ... and close its tolerance CSV
         self._hold_i = 0.0
         if not self.yaw_hold:  # nothing else holding -> settle to neutral
             for _ in range(5):
@@ -1922,16 +2305,22 @@ class App:
         return clamp(cmd if YAW_CW_IS_POSITIVE else -cmd)
 
     def step_holds(self, now):
-        """One control step for whichever hold(s) are active. Merges depth (heave)
-        and yaw into a single packet. Depth + yaw share one sensor packet, so if it
-        drops out both integrators reset and we send neutral (the sub then drifts
-        UP, away from the floor). STOP is always the backstop."""
+        """One control step for whichever hold(s) are active. Merges depth (heave),
+        yaw, and the forward-only surge into a single packet. Depth + yaw share one
+        sensor packet, so if it drops out both integrators reset and we send
+        neutral (the sub then drifts UP, away from the floor). STOP is always the
+        backstop. While FORWARD is latched this also appends a row to the
+        tolerance CSV."""
         dt = (now - self._hold_last_t) if self._hold_last_t else 0.0
         self._hold_last_t = now
         have = self.sensors.get() is not None
         heave = self._depth_hold_step(dt) if self.depth_hold else 0.0
         yaw = self._yaw_hold_step(dt) if self.yaw_hold else 0.0
-        thr = mix(0.0, 0.0, heave, yaw)  # holds drive heave + yaw only
+        # forward-only surge, whichever source is pushing harder. Never negative
+        # and never any strafe, so the holds keep their axes to themselves.
+        surge = max(HOLD_FWD_SURGE if self.hold_forward else 0.0, self.hold_pad_surge())
+        self.hold_surge = surge
+        thr = mix(surge, 0.0, heave, yaw)  # holds own heave + yaw; surge is ours
         try:
             self.sock.sendto(
                 thruster_packet(thr, self.amp, self.current_light()), self.thr_addr
@@ -1939,9 +2328,150 @@ class App:
         except Exception:
             pass
         with self.lock:
-            self.auto_cmd = (0.0, 0.0, heave, yaw)  # for the on-screen readout
+            self.auto_cmd = (surge, 0.0, heave, yaw)  # for the on-screen readout
+        # tolerance log (only open while FORWARD is latched); reads the sensors
+        # once more so the row carries exactly what the loops were given.
+        if self._fwd_log is not None:
+            self._log_fwd_row(
+                now, self.effective_depth(), self.effective_yaw(), surge, heave, yaw
+            )
         if not have:
             self.set_status("HOLD - no sensor data, neutral")
+
+    # ---- forward while holding (stick or latched button) ----
+    def toggle_hold_forward(self):
+        """Latch/unlatch the straight-ahead push. Only arms with BOTH holds on.
+        Latching also opens the depth/yaw tolerance CSV; unlatching closes it."""
+        if self.hold_forward:
+            self.hold_forward = False
+            self._stop_fwd_log()
+            self.set_status("FORWARD off - station keeping")
+            self.add_log("hold-forward OFF")
+        elif self.depth_hold and self.yaw_hold:
+            self.hold_forward = True
+            self._start_fwd_log()
+            self.set_status(
+                f">>> FORWARD (throttle {self.throttle_pct():.1f}%) - depth+yaw held"
+            )
+            self.add_log(f"hold-forward ON  throttle {self.throttle_pct():.1f}%")
+
+    # ---- FORWARD tolerance log (depth + yaw vs target while pushing ahead) ----
+    def _start_fwd_log(self):
+        """Open this push's CSV. One row every 1/FWD_LOG_HZ s with the tared
+        depth/yaw from the sub, their targets and errors, the commands going into
+        the mixer, and the throttle percentage. The filename carries both targets
+        and the throttle so runs can't be mixed up afterwards."""
+        if self._fwd_log is not None:
+            return
+        fn = (
+            f"forward_hold_{datetime.now():%Y%m%d_%H%M%S}"
+            f"_depth{self.hold_target:.2f}m"
+            f"_yaw{self.yaw_target:.1f}deg"
+            f"_thr{self.throttle_pct():.0f}pct.csv"
+        )
+        try:
+            f = open(fn, "w")
+        except OSError as e:
+            self.add_log(f"forward log failed: {e}")
+            print(f"[fwd] log open failed ({e}) - logging off")
+            return
+        f.write(
+            "t_epoch,iso_time,t_elapsed_s,"
+            "depth_m,depth_target_m,depth_err_m,"
+            "yaw_deg,yaw_target_deg,yaw_err_deg,"
+            "surge_cmd,heave_cmd,yaw_cmd,throttle_pct\n"
+        )
+        f.flush()
+        self._fwd_log = f
+        self._fwd_log_name = fn
+        self._fwd_log_t0 = time.time()
+        self._fwd_log_last = 0.0
+        # running tolerance stats -> the mean/max |error| summary printed on close
+        self._fwd_stats = {
+            "n": 0,
+            "d_sum": 0.0,
+            "d_max": 0.0,
+            "y_sum": 0.0,
+            "y_max": 0.0,
+        }
+        print(f"[fwd] logging -> {fn}")
+        self.add_log(f"forward log -> {fn}")
+
+    def _log_fwd_row(self, now, depth, yaw, surge, heave, yaw_cmd):
+        """Append one rate-limited row while FORWARD is latched. Missing sensor
+        data leaves the measured/error fields blank rather than faking a zero."""
+        if self._fwd_log is None:
+            return
+        # small epsilon: the caller ticks at 30 Hz (33.3 ms), so an exact 100 ms
+        # gate would land just short every third frame and log at 7.5 Hz instead.
+        if FWD_LOG_HZ > 0 and (now - self._fwd_log_last) < (1.0 / FWD_LOG_HZ) - 0.005:
+            return
+        self._fwd_log_last = now
+        d_err = None if depth is None else depth - self.hold_target
+        y_err = None if yaw is None else self._yaw_error(self.yaw_target, yaw)
+        st = self._fwd_stats
+        if st is not None and d_err is not None and y_err is not None:
+            st["n"] += 1
+            st["d_sum"] += abs(d_err)
+            st["d_max"] = max(st["d_max"], abs(d_err))
+            st["y_sum"] += abs(y_err)
+            st["y_max"] = max(st["y_max"], abs(y_err))
+        d_txt = "" if depth is None else f"{depth:.4f}"
+        de_txt = "" if d_err is None else f"{d_err:+.4f}"
+        y_txt = "" if yaw is None else f"{yaw:.2f}"
+        ye_txt = "" if y_err is None else f"{y_err:+.2f}"
+        iso = datetime.now().isoformat(timespec="milliseconds")
+        try:
+            self._fwd_log.write(
+                f"{now:.4f},{iso},{now - self._fwd_log_t0:.3f},"
+                f"{d_txt},{self.hold_target:.4f},{de_txt},"
+                f"{y_txt},{self.yaw_target:.2f},{ye_txt},"
+                f"{surge:+.3f},{heave:+.3f},{yaw_cmd:+.3f},"
+                f"{self.throttle_pct():.1f}\n"
+            )
+            self._fwd_log.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _stop_fwd_log(self):
+        """Close the CSV and report the tolerance the holds actually kept."""
+        if self._fwd_log is None:
+            return
+        st = self._fwd_stats or {}
+        n = st.get("n", 0)
+        name = self._fwd_log_name
+        try:
+            self._fwd_log.close()
+        except OSError:
+            pass
+        self._fwd_log = None
+        self._fwd_log_name = None
+        self._fwd_stats = None
+        if n:
+            d_mean = st["d_sum"] / n
+            y_mean = st["y_sum"] / n
+            d_max = st["d_max"]
+            y_max = st["y_max"]
+            msg = (
+                f"tol: depth mean {d_mean * 100:.1f} max {d_max * 100:.1f} cm  "
+                f"yaw mean {y_mean:.1f} max {y_max:.1f} deg  ({n} rows)"
+            )
+            self.add_log(msg)
+            print(f"[fwd] {msg}")
+        print(f"[fwd] saved {name}")
+        self.add_log(f"forward log saved: {name}")
+
+    def hold_pad_surge(self):
+        """Forward-ONLY surge from the left stick, live whenever a hold is running
+        -- no JOYSTICK: ON needed. Pull-back and the deadzone both read as 0, so
+        the pad can never reverse, strafe, or fight the hold loops."""
+        if self.joy is None:
+            return 0.0
+        try:
+            v = -self.joy.get_axis(1)  # stick up -> forward
+        except pygame.error:
+            return 0.0
+        return clamp(v) if v >= JOY_DEADZONE else 0.0
 
     # ---- yaw hold (independent PI mode; combines with depth hold) ----
     def toggle_yaw_hold(self):
@@ -1965,6 +2495,8 @@ class App:
 
     def _stop_yaw_hold(self):
         self.yaw_hold = False
+        self.hold_forward = False  # FORWARD needs BOTH holds -> drop the latch
+        self._stop_fwd_log()  # ... and close its tolerance CSV
         self._yaw_hold_i = 0.0
         if not self.depth_hold:  # nothing else holding -> settle to neutral
             for _ in range(5):
@@ -2035,8 +2567,8 @@ class App:
 
     def _commit_text_boxes(self, keep=None):
         """Commit every active click-to-type box except the one named by `keep`."""
-        if self.amp_active and keep != "amp":
-            self.commit_amp()
+        if self.thr_active and keep != "thr":
+            self.commit_throttle()
         if self.target_active and keep != "target":
             self.commit_target()
         if self.depth_min_active and keep != "min":
@@ -2050,7 +2582,7 @@ class App:
 
     def _draw_num_box(self, s, rect, active, editable, text, value_str):
         """Small text-box renderer shared by the depth min/max fields (same look
-        as the amp/target boxes, at the 18 px button font)."""
+        as the throttle/target boxes, at the 18 px button font)."""
         if active:
             bg, bd = (60, 70, 90), (255, 230, 120)
         elif editable:
@@ -2066,6 +2598,298 @@ class App:
         t = self.f_btn.render(disp, True, col)
         s.blit(t, t.get_rect(midleft=(rect.x + 6, rect.centery)))
 
+    # ---- always-on logging: 10 Hz telemetry CSV + the MCAP bag ----
+    def current_mode(self):
+        """Short, comma-free description of what is driving the sub right now --
+        one column in the CSV and one field in the bag, so any row can be traced
+        back to the mode it was recorded in."""
+        if self.running:
+            m = f"test:{self._test_label}"
+        elif self.autonomous:
+            m = f"auto:{self.auto_state}"
+        elif self.depth_hold or self.yaw_hold:
+            m = "hold:"
+            m += "D" if self.depth_hold else ""
+            m += "Y" if self.yaw_hold else ""
+            if self.hold_forward:
+                m += "+fwd"
+            elif self.hold_surge > 0.0:
+                m += "+pad"
+        elif self.joystick_on:
+            m = "joystick"
+        else:
+            m = "idle"
+        return m.replace(",", ";")  # never break the CSV
+
+    def current_cmd(self):
+        """(surge, strafe, heave, yaw) from whichever path currently owns the
+        thrusters; zeros when nothing is driving."""
+        if self.running:
+            return self.test_cmd
+        if self.autonomous or self.depth_hold or self.yaw_hold:
+            with self.lock:
+                return self.auto_cmd
+        if self.joystick_on:
+            return self.joy_cmd
+        return (0.0, 0.0, 0.0, 0.0)
+
+    @staticmethod
+    def _tag_msg(tid, dist):
+        """One tag as it appears in the bag."""
+        return {
+            "id": int(tid),
+            "distance_m": _round(dist, 4),
+            "under_1m": bool(dist is not None and dist < TAG_NEAR_M),
+        }
+
+    def _start_telem_log(self, stamp):
+        """Open the 10 Hz CSV. It supersedes the old apriltag_log_*.csv: same tag
+        id + distance columns, but now every row also carries depth, yaw, AMP and
+        thruster %, and rows keep coming when no tag is in view."""
+        if not TELEM_LOG_ENABLED:
+            return
+        fn = f"telemetry_log_{stamp}.csv"
+        try:
+            f = open(fn, "w")
+        except OSError as e:
+            print(f"[telem] log open failed ({e}) - CSV off")
+            return
+        f.write(
+            "t_epoch,iso_time,t_elapsed_s,seq,"
+            "tag_id,tag_distance_m,tag_under_1m,tag_count,"
+            "det_seq,det_t_epoch,det_age_ms,"
+            "depth_m,yaw_deg,depth_raw_m,yaw_raw_deg,sensors_ok,"
+            "throttle_pct,"
+            "mode,surge_cmd,strafe_cmd,heave_cmd,yaw_cmd,"
+            "light_pwm,led_flashing,flash_frame\n"
+        )
+        f.flush()
+        self._telem_csv = f
+        self._telem_name = fn
+        self._telem_t0 = time.time()
+        print(f"[telem] logging {TELEM_LOG_HZ:.0f} Hz -> {fn}")
+
+    def _telem_snapshot(self, now, flashing):
+        """Everything one tick records that isn't specific to a single tag."""
+        sv = self.sensors.get()
+        su, st_, hv, yw = self.current_cmd()
+        return {
+            "t": now,
+            "iso": datetime.now().isoformat(timespec="milliseconds"),
+            "elapsed": now - self._telem_t0,
+            "depth": self.effective_depth(),  # tared, + == deeper
+            "yaw": self.effective_yaw(),  # tared, wrapped to +-180
+            "depth_raw": None if sv is None else float(sv[0]),
+            "yaw_raw": None if sv is None else float(sv[1]),
+            "ok": sv is not None,
+            "throttle": self.throttle_pct(),
+            "mode": self.current_mode(),
+            "surge": su,
+            "strafe": st_,
+            "heave": hv,
+            "yaw_cmd": yw,
+            "light": int(self.current_light()),
+            "flashing": bool(flashing),
+        }
+
+    def _write_telem_row(
+        self,
+        s,
+        tag_id=None,
+        dist=None,
+        det_seq=None,
+        det_t=None,
+        tag_count=0,
+        flash_id=None,
+    ):
+        """One CSV row. Tag fields are blank on a plain tick; sensor fields are
+        blank (not zero) when there's no data."""
+        if self._telem_csv is None:
+            return
+        self._telem_seq += 1
+        near = "" if dist is None else ("1" if dist < TAG_NEAR_M else "0")
+        age = "" if det_t is None else f"{(s['t'] - det_t) * 1000.0:.1f}"
+        try:
+            self._telem_csv.write(
+                f"{s['t']:.4f},{s['iso']},{s['elapsed']:.3f},{self._telem_seq},"
+                f"{'' if tag_id is None else tag_id},{_num(dist, 4)},{near},"
+                f"{tag_count},"
+                f"{'' if det_seq is None else det_seq},{_num(det_t, 4)},{age},"
+                f"{_num(s['depth'], 4)},{_num(s['yaw'], 2)},"
+                f"{_num(s['depth_raw'], 4)},{_num(s['yaw_raw'], 2)},"
+                f"{1 if s['ok'] else 0},"
+                f"{s['throttle']:.1f},"
+                f"{s['mode']},{s['surge']:+.3f},{s['strafe']:+.3f},"
+                f"{s['heave']:+.3f},{s['yaw_cmd']:+.3f},"
+                f"{s['light']},{1 if s['flashing'] else 0},{flash_id or ''}\n"
+            )
+            if self._telem_seq % 10 == 0:  # ~1 s of buffering, not 1 row
+                self._telem_csv.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _telem_tick(self, now, flashing):
+        """One 10 Hz sample. Drains every detection the video thread queued since
+        the last tick (so nothing is lost even though the detector can run faster
+        than this poll), writes a CSV row per tag -- or a single plain row when
+        nothing was seen -- and publishes the matching bag messages."""
+        if self._telem_csv is None and (self.mcap is None or not self.mcap.ok):
+            return
+        if TELEM_LOG_HZ > 0 and (now - self._telem_last) < (1.0 / TELEM_LOG_HZ) - 0.005:
+            return
+        self._telem_last = now
+        s = self._telem_snapshot(now, flashing)
+        flash_id = self._pending_flash  # set by the last flash-frame grab
+        self._pending_flash = None
+        stamp_flash = flash_id  # consumed by the first row written this tick
+        events = self.video.drain_detections()
+        for det_t, det_seq, tags in events:
+            for tid, dist in tags:
+                self._write_telem_row(
+                    s,
+                    tag_id=tid,
+                    dist=dist,
+                    det_seq=det_seq,
+                    det_t=det_t,
+                    tag_count=len(tags),
+                    flash_id=stamp_flash,
+                )
+                stamp_flash = None
+            if self.mcap is not None:
+                self.mcap.write(
+                    "/apriltags",
+                    {
+                        "timestamp": det_t,
+                        "det_seq": det_seq,
+                        "det_age_ms": round((now - det_t) * 1000.0, 1),
+                        "count": len(tags),
+                        "tags": [self._tag_msg(i, d) for i, d in tags],
+                        "depth_m": _round(s["depth"], 4),
+                        "yaw_deg": _round(s["yaw"], 2),
+                        "sensors_ok": s["ok"],
+                        "throttle_pct": round(s["throttle"], 1),
+                        "mode": s["mode"],
+                        "led_flashing": s["flashing"],
+                    },
+                    det_t,
+                )
+        if not events:  # nothing seen this tick -> the plain heartbeat row
+            self._write_telem_row(s, flash_id=stamp_flash)
+        # exactly one /telemetry message per tick either way, so the bag has a
+        # clean fixed-rate stream to plot depth/yaw/thrust against
+        if self.mcap is not None:
+            dists = self.video.get_tag_dists()
+            self.mcap.write(
+                "/telemetry",
+                {
+                    "timestamp": s["t"],
+                    "seq": self._telem_seq,
+                    "elapsed_s": round(s["elapsed"], 3),
+                    "depth_m": _round(s["depth"], 4),
+                    "yaw_deg": _round(s["yaw"], 2),
+                    "depth_raw_m": _round(s["depth_raw"], 4),
+                    "yaw_raw_deg": _round(s["yaw_raw"], 2),
+                    "sensors_ok": s["ok"],
+                    "throttle_pct": round(s["throttle"], 1),
+                    "mode": s["mode"],
+                    "surge": round(s["surge"], 3),
+                    "strafe": round(s["strafe"], 3),
+                    "heave": round(s["heave"], 3),
+                    "yaw": round(s["yaw_cmd"], 3),
+                    "depth_target_m": (
+                        round(self.hold_target, 3) if self.depth_hold else None
+                    ),
+                    "yaw_target_deg": (
+                        round(self.yaw_target, 2) if self.yaw_hold else None
+                    ),
+                    "light_pwm": s["light"],
+                    "led_flashing": s["flashing"],
+                    "tag_count": len(dists),
+                    "tags": [self._tag_msg(i, d) for i, d in sorted(dists.items())],
+                    "flash_frame": flash_id or "",
+                },
+                now,
+            )
+
+    def _stop_telem_log(self):
+        if self._telem_csv is None:
+            return
+        try:
+            self._telem_csv.flush()
+            self._telem_csv.close()
+        except OSError:
+            pass
+        print(f"[telem] saved {self._telem_name}  {self._telem_seq} rows")
+        self._telem_csv = None
+
+    def _capture_flash_frame(self, now):
+        """ONE annotated frame at the start of a flash episode. The frame already
+        carries the tag outline and its `id N 0.42m` label from the overlay; this
+        adds a burned-in banner with the time, the close tags, depth/yaw and the
+        thruster %, so the image is self-describing even out of context. Goes into
+        the bag as a compressed image; with no mcap package it lands as a .jpg.
+        Either way the frame id is stamped onto the next telemetry row."""
+        self._flash_count += 1
+        fid = f"flash_{self._flash_count:04d}"
+        self._pending_flash = fid
+        dists = self.video.get_tag_dists()
+        near = sorted(
+            (i, d) for i, d in dists.items() if d is not None and d < TAG_NEAR_M
+        )
+        tag_txt = ", ".join(f"id {i} {dd:.2f}m" for i, dd in near) or "no tag under 1 m"
+        d = self.effective_depth()
+        y = self.effective_yaw()
+        d_txt = "--" if d is None else f"{d:+.2f}"
+        y_txt = "--" if y is None else f"{y:+.1f}"
+        info = (
+            f"depth {d_txt} m   yaw {y_txt} deg   throttle {self.throttle_pct():.1f}%"
+        )
+        frame = self.video.get_frame()
+        if frame is None:  # flashing with the stream down -- still an event
+            self.add_log(f"{fid}: LED flash, no video frame ({tag_txt})")
+            return
+        img = frame.copy()  # never draw on the frame the UI is blitting
+        h, w = img.shape[:2]
+        ov = img.copy()
+        cv2.rectangle(ov, (0, 0), (w, 76), (0, 0, 0), -1)
+        cv2.addWeighted(ov, 0.6, img, 0.4, 0, img)
+        clock = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        for i, line in enumerate((f"{fid}  LED FLASH  {clock}", tag_txt, info)):
+            cv2.putText(
+                img,
+                line,
+                (8, 22 + i * 22),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                (0, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        ok, buf = cv2.imencode(
+            ".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), FLASH_JPEG_QUALITY]
+        )
+        if not ok:
+            self.add_log(f"{fid}: jpeg encode failed")
+            return
+        if self.mcap is not None and self.mcap.ok:
+            self.mcap.write_image(buf.tobytes(), now)
+            self.add_log(f"{fid} -> mcap  ({tag_txt})")
+            return
+        if self._flash_dir is None:  # fallback: frames as files on disk
+            self._flash_dir = f"flash_frames_{datetime.now():%Y%m%d_%H%M%S}"
+            try:
+                os.makedirs(self._flash_dir, exist_ok=True)
+            except OSError as e:
+                print(f"[flash] cannot create {self._flash_dir} ({e}) - using .")
+                self._flash_dir = "."
+        path = os.path.join(self._flash_dir, f"{fid}.jpg")
+        try:
+            with open(path, "wb") as fh:
+                fh.write(buf.tobytes())
+            self.add_log(f"{fid} -> {path}  ({tag_txt})")
+        except OSError as e:
+            self.add_log(f"{fid}: save failed ({e})")
+
     def set_status(self, s):
         with self.lock:
             self.status = s
@@ -2074,6 +2898,10 @@ class App:
         with self.lock:
             self.log.append(s)
             self.log = self.log[-5:]
+        # every UI log line is also an /events entry, so the bag carries a
+        # plain-text account of what the operator did and when.
+        if self.mcap is not None:
+            self.mcap.event(s)
 
     # thruster test run
     def start(self, motion, sign):
@@ -2089,6 +2917,8 @@ class App:
         self.joystick_on = False  # and manual gamepad control
         self.depth_hold = False  # and depth hold
         self.yaw_hold = False  # and yaw hold
+        self.hold_forward = False  # and the latched forward push
+        self._stop_fwd_log()  # ... closing its tolerance CSV cleanly
         for _ in range(5):
             self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
         self.set_status("STOP - neutral sent")
@@ -2098,7 +2928,9 @@ class App:
         cmd[motion] = float(sign)
         thr = mix(cmd["surge"], cmd["strafe"], cmd["heave"], cmd["yaw"])
         label = f"{motion} {'+' if sign > 0 else '-'}"
-        self.add_log(f"{label}  amp={self.amp}  {self.duration}s")
+        self._test_label = f"{motion}{'+' if sign > 0 else '-'}"
+        self.test_cmd = (cmd["surge"], cmd["strafe"], cmd["heave"], cmd["yaw"])
+        self.add_log(f"{label}  throttle {self.throttle_pct():.1f}%  {self.duration}s")
         recording = self.capture
         if recording:
             fname = f"capture_{motion}_{'+' if sign > 0 else '-'}_{time.strftime('%H%M%S')}.csv"
@@ -2165,6 +2997,7 @@ class App:
                 self.set_status(">>> STOP - measure start to rest (no sensor data)")
         if recording:
             self.sensors.stop_record()
+        self.test_cmd = (0.0, 0.0, 0.0, 0.0)
         self.running = False
 
     # main loop
@@ -2178,9 +3011,9 @@ class App:
                     return
                 if e.type == pygame.MOUSEBUTTONDOWN and e.button == 1:
                     # Text boxes: click inside to focus, click outside to commit.
-                    if self.amp_rect.collidepoint(e.pos) and self.amp_editable():
-                        self._commit_text_boxes(keep="amp")
-                        self.amp_active = True
+                    if self.thr_rect.collidepoint(e.pos) and self.throttle_editable():
+                        self._commit_text_boxes(keep="thr")
+                        self.thr_active = True
                         continue
                     if self.target_rect.collidepoint(e.pos) and self.target_editable():
                         self._commit_text_boxes(keep="target")
@@ -2233,17 +3066,17 @@ class App:
                         self.panel_scroll = max(
                             0, min(self._scroll_max(), self.panel_scroll)
                         )
-                if e.type == pygame.KEYDOWN and self.amp_active:
+                if e.type == pygame.KEYDOWN and self.thr_active:
                     if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                        self.commit_amp()
+                        self.commit_throttle()
                     elif e.key == pygame.K_ESCAPE:
                         # discard edits, restore committed value
-                        self.amp_text = str(self.amp)
-                        self.amp_active = False
+                        self.thr_text = f"{self.throttle_pct():.1f}"
+                        self.thr_active = False
                     elif e.key == pygame.K_BACKSPACE:
-                        self.amp_text = self.amp_text[:-1]
-                    elif e.unicode.isdigit() and len(self.amp_text) < 3:
-                        self.amp_text += e.unicode
+                        self.thr_text = self.thr_text[:-1]
+                    elif e.unicode in "0123456789." and len(self.thr_text) < 5:
+                        self.thr_text += e.unicode
                 if e.type == pygame.KEYDOWN and self.target_active:
                     if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
                         self.commit_target()
@@ -2294,18 +3127,19 @@ class App:
                         self.yaw_target_text = self.yaw_target_text[:-1]
                     elif e.unicode in "0123456789.-" and len(self.yaw_target_text) < 6:
                         self.yaw_target_text += e.unicode
-                # ---- gamepad: D-pad steps amp, X/B toggle light/tag-flash ----
+                # ---- gamepad: D-pad steps throttle, X/B toggle light/flash ----
                 if (
                     e.type == pygame.JOYHATMOTION
                     and self.joystick_on
-                    and self.amp_editable()
+                    and self.throttle_editable()
                 ):
+                    step = amp_from_percent(25.0)  # D-pad steps throttle by 25 %
                     if e.value[1] > 0:  # D-pad up
-                        self.amp = min(AMP_MAX, self.amp + 100)
-                        self.amp_text = str(self.amp)
+                        self.amp = min(AMP_MAX, self.amp + step)
+                        self.thr_text = f"{self.throttle_pct():.1f}"
                     elif e.value[1] < 0:  # D-pad down
-                        self.amp = max(AMP_MIN, self.amp - 100)
-                        self.amp_text = str(self.amp)
+                        self.amp = max(AMP_MIN, self.amp - step)
+                        self.thr_text = f"{self.throttle_pct():.1f}"
                 if e.type == pygame.JOYBUTTONDOWN and self.joystick_on:
                     if e.button == 2:  # X -> light toggle
                         self.toggle_light()
@@ -2336,11 +3170,18 @@ class App:
             # server keep-alive) or send neutral packets carrying the current
             # light value. Keeps LIGHT / TAG FLASH live and satisfies the
             # server's 0.5s watchdog. ~20-30 Hz is plenty.
-            # keep the video logger's view of the LED state current, so the tag
-            # CSV's led_flashed column reflects whether the LEDs were flashing when
-            # each close tag was logged.
-            self.video.led_flashing = self.is_flashing()
             now = time.time()
+            # ONE frame per flash EPISODE: grab on the rising edge of the blink
+            # gate (checked at the full 30 Hz so the grab lands at the start of
+            # the episode, not up to 100 ms into it).
+            flashing = self.is_flashing()
+            if flashing and not self._flash_prev:
+                self._capture_flash_frame(now)
+            self._flash_prev = flashing
+            # 10 Hz always-on telemetry -> CSV + MCAP. Runs in every mode, and
+            # keeps ticking with no video and no sensor data (the missing fields
+            # just come out blank), so the log never has silent gaps.
+            self._telem_tick(now, flashing)
             if not self.running and not self.autonomous:
                 if self.depth_hold or self.yaw_hold:
                     self.step_holds(now)  # depth/yaw PI drives + keeps link alive
@@ -2365,11 +3206,20 @@ class App:
             clock.tick(30)
 
     def shutdown(self):
+        """Bring the sub to neutral and CLOSE BOTH LOGS. Safe to call twice: the
+        window-close handler calls it, and so does main()'s finally, so a crash
+        or a Ctrl-C still finishes the .mcap. Skipping finish() leaves a file
+        Foxglove refuses to open ('the file is empty')."""
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
         self.abort = True
         self.autonomous = False
         self.joystick_on = False
         self.depth_hold = False
         self.yaw_hold = False
+        self.hold_forward = False
+        self._stop_fwd_log()  # flush + close the tolerance CSV on exit
         try:
             self.sock.sendto(neutral_packet(), self.thr_addr)
         except Exception:
@@ -2377,6 +3227,9 @@ class App:
         self.video.stop_event.set()
         self.sensors.stop_event.set()
         time.sleep(0.1)
+        self._stop_telem_log()  # finish both always-on logs cleanly; the mcap
+        if self.mcap is not None:  # MUST be finish()ed or the bag won't open
+            self.mcap.close()
         pygame.quit()
 
     def draw(self):
@@ -2388,28 +3241,31 @@ class App:
             ),
             (20, 16),
         )
-        # captions + values for duration stepper
+        # captions for the duration stepper and the throttle box
         s.blit(self.f_small.render("Duration", True, (180, 180, 180)), (20, 70))
-        s.blit(self.f_small.render("AMP (0-400)", True, (180, 180, 180)), (200, 70))
+        s.blit(
+            self.f_small.render("THROTTLE % (0-100)", True, (180, 180, 180)),
+            (200, 70),
+        )
         s.blit(
             self.f_status.render(f"{self.duration}s", True, (255, 255, 255)), (66, 92)
         )
-        # AMP text box
-        editable = self.amp_editable()
-        if self.amp_active:
+        # THROTTLE text box (percent)
+        editable = self.throttle_editable()
+        if self.thr_active:
             box_bg, border = (60, 70, 90), (255, 230, 120)
         elif editable:
             box_bg, border = (45, 47, 55), (150, 150, 160)
         else:
             box_bg, border = (40, 40, 45), (80, 80, 85)  # greyed while running
-        pygame.draw.rect(s, box_bg, self.amp_rect, border_radius=6)
-        pygame.draw.rect(s, border, self.amp_rect, width=2, border_radius=6)
-        disp = self.amp_text if self.amp_active else str(self.amp)
-        if self.amp_active and int(time.time() * 2) % 2 == 0:
+        pygame.draw.rect(s, box_bg, self.thr_rect, border_radius=6)
+        pygame.draw.rect(s, border, self.thr_rect, width=2, border_radius=6)
+        disp = self.thr_text if self.thr_active else f"{self.throttle_pct():.1f} %"
+        if self.thr_active and int(time.time() * 2) % 2 == 0:
             disp += "|"  # blinking caret
         txt_col = (255, 255, 255) if editable else (120, 120, 120)
         at = self.f_status.render(disp, True, txt_col)
-        s.blit(at, at.get_rect(midleft=(self.amp_rect.x + 8, self.amp_rect.centery)))
+        s.blit(at, at.get_rect(midleft=(self.thr_rect.x + 8, self.thr_rect.centery)))
         for b in self.buttons:
             b.draw(s, self.f_btn)
         with self.lock:
@@ -2462,6 +3318,23 @@ class App:
                 self.f_small.render("\u25cf REC", True, (255, 80, 80)),
                 (self.vid_rect.x + 8, self.vid_rect.y + 8),
             )
+        # always-on logging status (bottom-right of the video panel)
+        if self.mcap is not None and self.mcap.ok:
+            log_txt = f"MCAP {self.mcap.msgs} msgs  {self.mcap.images} frames"
+            log_col = (150, 210, 170)
+        elif self._flash_count:
+            log_txt = f"no MCAP - {self._flash_count} flash jpgs"
+            log_col = (220, 190, 130)
+        else:
+            log_txt = "no MCAP (pip install mcap)"
+            log_col = (190, 150, 150)
+        lt = self.f_small.render(log_txt, True, log_col)
+        s.blit(
+            lt,
+            lt.get_rect(
+                bottomright=(self.vid_rect.right - 8, self.vid_rect.bottom - 6)
+            ),
+        )
         if self.depth_hold or self.yaw_hold:
             hv, yw = self.auto_cmd[2], self.auto_cmd[3]
             d = self.effective_depth()
@@ -2495,6 +3368,28 @@ class App:
                     sub = "yaw    no data - holding neutral"
                 s.blit(
                     self.f_small.render(sub, True, (150, 200, 220)),
+                    (self.vid_rect.x + 8, line_y),
+                )
+                line_y += 20
+            # forward-only surge line: latched button or the pad's stick
+            if self.hold_forward or self.hold_surge > 0.0:
+                src = "FORWARD latched" if self.hold_forward else "pad stick"
+                s.blit(
+                    self.f_small.render(
+                        f"surge  {self.hold_surge:+.2f}  ({src}, "
+                        f"throttle {self.throttle_pct():.1f}%)",
+                        True,
+                        (180, 220, 150),
+                    ),
+                    (self.vid_rect.x + 8, line_y),
+                )
+                line_y += 20
+            # tolerance CSV indicator while the FORWARD log is open
+            if self._fwd_log is not None:
+                s.blit(
+                    self.f_small.render(
+                        f"\u25cf LOG  {self._fwd_log_name}", True, (255, 170, 170)
+                    ),
                     (self.vid_rect.x + 8, line_y),
                 )
                 line_y += 20
@@ -2767,7 +3662,7 @@ def main():
     )
     ap.add_argument("--wifi", action="store_true")
     ap.add_argument(
-        "--weights", default="best.pt", help="YOLOv26 weights to enable detection"
+        "--weights", default="mit.pt", help="YOLOv26 weights to enable detection"
     )
     ap.add_argument("--conf", type=float, default=0.65)
     ap.add_argument("--yolo-interval", type=int, default=3)
@@ -2785,7 +3680,25 @@ def main():
     Strategy, BoundingBox, HAVE_STRATEGY, _STRATEGY_ERR = load_strategy(args.strategy)
 
     mode = "wifi" if args.wifi else "lan"
-    App(mode, args.weights, args.conf, args.yolo_interval).run()
+    app = App(mode, args.weights, args.conf, args.yolo_interval)
+
+    # SIGINT already raises KeyboardInterrupt in the main thread; make SIGTERM do
+    # the same so `kill` unwinds through the finally too. Between them and the
+    # bare except, every exit path reaches shutdown() -- which is the only place
+    # the .mcap gets its index written.
+    def _term(_sig, _frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(signal.SIGTERM, _term)
+    except (ValueError, AttributeError, OSError):
+        pass  # platform doesn't allow it -- Ctrl-C and clean quit still work
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        print("\n[exit] interrupted - closing logs")
+    finally:
+        app.shutdown()
 
 
 if __name__ == "__main__":

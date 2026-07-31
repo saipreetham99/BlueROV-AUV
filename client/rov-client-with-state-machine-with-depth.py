@@ -45,7 +45,7 @@ Strategy = None
 BoundingBox = None
 HAVE_STRATEGY = False
 _STRATEGY_ERR = ""
-_STRATEGY_NAME = "new_strategy_full"  # updated by main() to whatever --strategy picked
+_STRATEGY_NAME = "strategy_full"  # updated by main() to whatever --strategy picked
 
 
 def load_strategy(module_name):
@@ -69,40 +69,19 @@ GAINS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), GAINS_FILE
 PARAMS = [
     (
         "yaw_kp",
-        "Yaw kp (advance/scan)",
+        "Yaw kp (turn)",
         0.0,
         0.01,
         0.00005,
-        "How hard it turns to center the target left/right while CHASING or "
-        "SCANNING. Orbit has its own gain below.",
+        "How hard it turns to center the target left/right (higher = snappier).",
     ),
     (
         "heave_kp",
-        "Heave kp (advance/scan)",
+        "Heave kp (up/down)",
         0.0,
         0.01,
         0.00005,
-        "How hard it dives/climbs to center the target up/down while CHASING or "
-        "SCANNING. Orbit has its own gain below.",
-    ),
-    (
-        "orbit_yaw_kp",
-        "Orbit yaw kp",
-        0.0,
-        0.01,
-        0.00005,
-        "Yaw centering gain used ONLY while ORBITING. Orbit fights the bearing "
-        "error its own strafe creates, so too high here judders left/right "
-        "instead of circling.",
-    ),
-    (
-        "orbit_heave_kp",
-        "Orbit heave kp",
-        0.0,
-        0.01,
-        0.00005,
-        "Heave centering gain used ONLY while ORBITING. Lower than the chase gain "
-        "keeps the frame steady at close range.",
+        "How hard it dives/climbs to center the target up/down (higher = faster).",
     ),
     (
         "advance_surge",
@@ -299,8 +278,6 @@ PARAMS = [
 DEFAULTS = {
     "yaw_kp": 0.0003,
     "heave_kp": 0.0003,
-    "orbit_yaw_kp": 0.0003,
-    "orbit_heave_kp": 0.0003,
     "advance_surge": 0.8,
     "approach_offset_px": 80.0,
     "orbit_strafe": 0.8,
@@ -345,19 +322,11 @@ def load_gains():
         and isinstance(g.get("centering_kp"), (int, float))
     ):
         out["yaw_kp"] = out["heave_kp"] = float(g["centering_kp"])
-    # Mirror the brain's own fallback: an orbit gain absent from the file INHERITS
-    # its advance counterpart. Without this the panel would show the 0.0003 default
-    # while the brain is actually running the advance value, and the first touch of
-    # the slider would silently write the panel's wrong number to disk.
-    if not isinstance(g.get("orbit_yaw_kp"), (int, float)):
-        out["orbit_yaw_kp"] = out["yaw_kp"]
-    if not isinstance(g.get("orbit_heave_kp"), (int, float)):
-        out["orbit_heave_kp"] = out["heave_kp"]
     return out
 
 
 def fmt_gain(key, v):
-    if key in ("yaw_kp", "heave_kp", "orbit_yaw_kp", "orbit_heave_kp"):
+    if key in ("yaw_kp", "heave_kp"):
         return f"{v:.5f}"
     if key in ("search_yaw_command", "orbit_enter_frac", "orbit_hold_frac"):
         return f"{v:.3f}"
@@ -384,26 +353,6 @@ AMP_MIN = 0
 AMP_MAX = 400
 JOY_DEADZONE = 0.12  # ignore small stick drift around center
 
-# ---------- AprilTag distance / pose ----------
-# These are the knobs you change when the tag or the lens changes. TAG_SIZE_M is
-# the ONLY one that affects the geometry directly; everything else is calibration.
-TAG_SIZE_M = 0.03145  # 31.45 mm: outer edge of the tag's BLACK square (see steps)
-TAG_CELL_M = 0.00912  # 9.12 mm: one module/cell (reference only; NOT used in math)
-CAMERA_HFOV_DEG = 110.0  # BlueROV2 low-light lens ~110 deg in air (tune -- see steps)
-DIST_SCALE = 4.63  # single calibration knob: set = true_metres / measured_reading @1m
-TAG_NEAR_M = 1.0  # a tag counts as "close" (light may flash) under this distance
-TAG_LOG_ENABLED = True  # write apriltag_log_*.csv of every detection (id, dist, time)
-
-
-def camera_intrinsics(w, h):
-    """Pinhole intrinsics (fx, fy, cx, cy) from the horizontal FOV -- no full
-    calibration needed for a first pass. Resolution is read live from the frame so
-    this stays correct whatever the server streams. For best off-axis accuracy,
-    replace the body with real calibrated values (see the undistort steps)."""
-    f = (w / 2.0) / np.tan(np.radians(CAMERA_HFOV_DEG) / 2.0)
-    return f, f, w / 2.0, h / 2.0
-
-
 # ---------- depth safety envelope ----------
 # The sub is kept inside [depth_min, depth_max] (metres, measured from wherever
 # you press ZERO DEPTH). This guard overrides autonomy, the thruster test, AND
@@ -414,7 +363,7 @@ def camera_intrinsics(w, h):
 #   must go MORE POSITIVE. If it goes negative instead, set DEPTH_INCREASES_DOWN
 #   to False (that's the ONLY change needed -- everything else keys off it).
 DEPTH_INCREASES_DOWN = True  # True: deeper == larger sensor reading
-DEPTH_MARGIN = 0.30  # m: stop allowing "further past" this far before a limit
+DEPTH_MARGIN = 0.10  # m: stop allowing "further past" this far before a limit
 DEPTH_RECOVER = 0.40  # 0..1 heave used to gently climb/dive back once past a limit
 
 # ---------- depth hold (independent mode: PI loop on the depth sensor) ----------
@@ -425,29 +374,10 @@ DEPTH_RECOVER = 0.40  # 0..1 heave used to gently climb/dive back once past a li
 # drag already damps things; add one only if it oscillates. All heave output is
 # scaled by AMP in the packet, so these gains are relative to AMP: tune them at
 # the AMP you'll actually demo with. Start here and adjust.
-HOLD_KP = 2.0  # heave per metre of error (0.3 m off -> ~0.45 heave before AMP)
+HOLD_KP = 1.5  # heave per metre of error (0.3 m off -> ~0.45 heave before AMP)
 HOLD_KI = 0.4  # heave per metre-second of accumulated error (buoyancy trim)
 HOLD_I_LIMIT = 0.5  # cap on the heave the integral alone can command (anti-windup)
 HOLD_DEADBAND = 0.02  # m: freeze the integrator within +-2 cm so it won't hunt on noise
-
-# ---------- yaw hold (independent mode: PI loop on the heading sensor) ----------
-# YAW HOLD parks the sub on a typed heading (degrees, relative to wherever you
-# press ZERO YAW). Same PI shape as depth hold: P reacts to how far off the
-# heading is, I trims a steady bias (e.g. a tether pull). No D term. Yaw is
-# circular, so the error is the SHORTEST signed angle (wrapped to +-180 deg): at
-# 179 deg off it turns the short 1-deg way, not most of a lap. Output is scaled by
-# AMP in the packet, so tune at the AMP you'll demo with. Errors here are in
-# DEGREES (up to 180), so KP is far smaller than depth's. Depth and yaw drive
-# independent axes, so YAW HOLD can run alone or alongside DEPTH HOLD.
-YAW_HOLD_KP = 0.018  # yaw per degree of error (30 deg off -> ~0.30 yaw before AMP)
-YAW_HOLD_KI = 0.004  # yaw per degree-second of accumulated error (steady-bias trim)
-YAW_HOLD_I_LIMIT = 0.3  # cap on the yaw the integral alone can command (anti-windup)
-YAW_HOLD_DEADBAND = 2.0  # deg: freeze the integrator within +-2 deg so it won't hunt
-# SIGN CONVENTION -- verify in the water before trusting the hold:
-#   with yaw hold OFF, push a +yaw (turn-right) command from the pad and watch the
-#   on-screen Yaw reading. If it goes UP (more positive), leave this True; if it
-#   goes DOWN, set it False (the ONLY change needed -- the loop keys off it).
-YAW_CW_IS_POSITIVE = False
 
 
 # ---------- shared thruster core (identical to pool_test.py) ----------
@@ -641,7 +571,7 @@ def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
 
 
 class VideoReceiver(threading.Thread):
-    def __init__(self, server_ip, port, weights="best.pt", conf=0.65, yolo_interval=3):
+    def __init__(self, server_ip, port, weights=None, conf=0.8, yolo_interval=3):
         super().__init__(daemon=True)
         self.server_ip = server_ip
         self.port = port
@@ -661,26 +591,6 @@ class VideoReceiver(threading.Thread):
             print("[tags] AprilTag detection on")
         except ImportError:
             print("[tags] pupil_apriltags not installed - tag overlay off")
-        # per-tag distance (metres): id -> dist, published for the UI + light gate.
-        self.tag_dists = {}
-        self._last_tag_dists = {}  # working copy, filled during a detection frame
-        # set by App every frame: True while the light is in flash/blink mode,
-        # so the tag CSV can record when the LEDs actually flashed.
-        self.led_flashing = False
-        # open a CSV logging EVERY detection (all modes): id, distance, timestamps
-        self.tag_log = None
-        if TAG_LOG_ENABLED:
-            fn = f"apriltag_log_{datetime.now():%Y%m%d_%H%M%S}.csv"
-            try:
-                self.tag_log = open(fn, "w")
-                self.tag_log.write(
-                    "t_epoch,iso_time,tag_id,distance_m,under_1m,led_flashed\n"
-                )
-                self.tag_log.flush()
-                print(f"[tags] logging detections -> {fn}")
-            except OSError as e:
-                print(f"[tags] log open failed ({e}) - logging off")
-                self.tag_log = None
         # AprilTag detect() is CPU-heavy; run it every Nth frame (not every frame)
         # so it can't throttle the YOLO/box path. Between detections we reuse and
         # redraw the last result, so tag_ids stays populated for the mission
@@ -763,74 +673,33 @@ class VideoReceiver(threading.Thread):
                 # down. ids stays populated for the mission counter + back_visible.
                 if self.tag_det is not None and rf % self.tag_interval == 0:
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                    # intrinsics from the live frame size -> pose in metres
-                    fx, fy, cx0, cy0 = camera_intrinsics(frame.shape[1], frame.shape[0])
                     self._last_tag_ids = []
                     self._last_tag_hits = []
-                    self._last_tag_dists = {}
-                    dets = self.tag_det.detect(
-                        gray,
-                        estimate_tag_pose=True,
-                        camera_params=(fx, fy, cx0, cy0),
-                        tag_size=TAG_SIZE_M,
-                    )
-                    for tag in dets:
+                    for tag in self.tag_det.detect(gray):
                         pts = tag.corners.astype(int)
                         ctr = tuple(map(int, tag.center))
-                        tid = int(tag.tag_id)
-                        # straight-line range = |translation|; scaled by the
-                        # one-point calibration knob. pose_t may be None if the
-                        # solve failed -> distance stays unknown (None).
-                        dist = (
-                            float(np.linalg.norm(tag.pose_t)) * DIST_SCALE
-                            if tag.pose_t is not None
-                            else None
-                        )
-                        self._last_tag_hits.append((pts, ctr, tid, dist))
-                        self._last_tag_ids.append(tid)
-                        if dist is not None:
-                            self._last_tag_dists[tid] = dist
-                    # log EVERY detection this cycle (all modes).
-                    #   under 1 m: full row (id, distance, under_1m=1) plus whether
-                    #     the LEDs were flashing when it was logged.
-                    #   over 1 m / unknown range: id + timestamp only, rest blank.
-                    if self.tag_log is not None and self._last_tag_hits:
-                        t_epoch = time.time()
-                        iso = datetime.now().isoformat(timespec="milliseconds")
-                        led = 1 if self.led_flashing else 0
-                        for _p, _c, tid, dist in self._last_tag_hits:
-                            near = dist is not None and dist < TAG_NEAR_M
-                            if near:
-                                self.tag_log.write(
-                                    f"{t_epoch:.4f},{iso},{tid},{dist:.4f},1,{led}\n"
-                                )
-                            else:
-                                self.tag_log.write(f"{t_epoch:.4f},{iso},{tid},,,\n")
-                        self.tag_log.flush()
+                        self._last_tag_hits.append((pts, ctr, int(tag.tag_id)))
+                        self._last_tag_ids.append(int(tag.tag_id))
                 ids = self._last_tag_ids
                 # redraw the cached tags every frame (cheap) so the overlay stays
-                # smooth even on the frames we skip detection. green == within
-                # TAG_NEAR_M (a "close" tag), amber == farther / unknown distance.
-                for pts, (cx, cy), tid, dist in self._last_tag_hits:
-                    near = dist is not None and dist < TAG_NEAR_M
-                    col = (0, 255, 0) if near else (0, 200, 255)
+                # smooth even on the frames we skip detection
+                for pts, (cx, cy), tid in self._last_tag_hits:
                     for i in range(4):
                         cv2.line(
                             frame,
                             tuple(pts[i]),
                             tuple(pts[(i + 1) % 4]),
-                            col,
+                            (0, 255, 0),
                             2,
                         )
                     cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
-                    label = f"id {tid}" + ("" if dist is None else f" {dist:.2f}m")
                     cv2.putText(
                         frame,
-                        label,
+                        f"id {tid}",
                         (cx + 8, cy - 8),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.7,
-                        col,
+                        (0, 255, 0),
                         2,
                     )
                 # Hand the freshest frame to the YOLO worker EVERY frame (no
@@ -880,7 +749,6 @@ class VideoReceiver(threading.Thread):
                     self.latest = frame
                     self.last_time = time.time()
                     self.tag_ids = ids
-                    self.tag_dists = dict(self._last_tag_dists)
                     self._auto_boxes = list(self.last_boxes)
                     self._auto_dims = (frame.shape[1], frame.shape[0])
                     # advance the box-ready stamp + det-rate ONLY when a fresh box
@@ -903,7 +771,6 @@ class VideoReceiver(threading.Thread):
         sock.close()
         self.rec.stop()
         self._stop_yolo()
-        self._close_tag_log()
 
     def _stop_yolo(self):
         if self.yolo_proc is None:
@@ -930,31 +797,6 @@ class VideoReceiver(threading.Thread):
     def get_tag_ids(self):
         with self.lock:
             return list(self.tag_ids)
-
-    def _close_tag_log(self):
-        if self.tag_log is not None:
-            try:
-                self.tag_log.close()
-            except Exception:
-                pass
-            self.tag_log = None
-
-    def get_tag_dists(self):
-        """id -> distance (m) for the tags in the freshest detection."""
-        with self.lock:
-            return dict(self.tag_dists)
-
-    def get_near_tag_ids(self, thresh=TAG_NEAR_M):
-        """IDs of tags whose measured distance is under `thresh` metres."""
-        with self.lock:
-            return [
-                t for t, d in self.tag_dists.items() if d is not None and d < thresh
-            ]
-
-    def any_tag_near(self, thresh=TAG_NEAR_M):
-        """True if at least one detected tag is within `thresh` metres."""
-        with self.lock:
-            return any(d is not None and d < thresh for d in self.tag_dists.values())
 
     def get_detection(self):
         """Freshest YOLO box (x1, y1, x2, y2) or None, plus the frame size (w, h).
@@ -1017,7 +859,7 @@ class App:
         )
         self.thr_addr = (self.rov_ip, self.thr_port)
         pygame.init()
-        self.W, self.H = 1000, 780
+        self.W, self.H = 1000, 720
         # --- tune panel: docks to the right; window widens when open ---
         self.PANEL_W = 380
         self.PANEL_X = self.W  # panel starts just past the main area
@@ -1073,18 +915,7 @@ class App:
         self.hold_target_active = False
         self.hold_target_rect = pygame.Rect(612, 680, 58, 32)
         self._hold_i = 0.0
-        self._hold_last_t = 0.0  # shared dt clock for BOTH depth + yaw hold
-        # Yaw HOLD: independent PI heading-hold. Drives only yaw, so it can run
-        # alone or together with depth hold (station-keep). yaw_zero is the RAW
-        # heading that counts as 0 (set by ZERO YAW); effective_yaw() subtracts it
-        # and wraps to +-180. _yaw_hold_i is this loop's own integrator.
-        self.yaw_hold = False
-        self.yaw_target = 0.0
-        self.yaw_zero = 0.0
-        self.yaw_target_text = f"{self.yaw_target:.1f}"
-        self.yaw_target_active = False
-        self.yaw_target_rect = pygame.Rect(440, 736, 70, 32)
-        self._yaw_hold_i = 0.0
+        self._hold_last_t = 0.0
         self.capture = False
         self.rate = 50.0
         # light state
@@ -1103,9 +934,6 @@ class App:
         # while autonomous, each distinct tag ID seen is remembered; reaching
         # tag_target flashes the lights and hands off to the pad.
         self.collected_tags = set()
-        # True once >=1 tag has been seen within TAG_NEAR_M (1 m). Completion needs
-        # this AND enough unique tags, so far-only sightings can't end the mission.
-        self.seen_near = False
         self.mission_complete = False
         self.celebrate_until = 0.0  # lights flash while now < this
         # manual joystick (gamepad) control
@@ -1136,7 +964,6 @@ class App:
             and not self.autonomous
             and not self.joystick_on
             and not self.depth_hold
-            and not self.yaw_hold
         )
         self.buttons = []
         self.buttons.append(
@@ -1209,7 +1036,6 @@ class App:
                         and not self.autonomous
                         and not self.running
                         and not self.depth_hold
-                        and not self.yaw_hold
                     )
                 ),
             )
@@ -1284,36 +1110,6 @@ class App:
                 ),
             )
         )
-        # ZERO YAW: snapshot the current heading as 0 (press pointed where you
-        # want 0). Greyed during a yaw hold (re-taring would move the target).
-        self.buttons.append(
-            Button(
-                (680, 734, 120, 36),
-                "ZERO YAW",
-                self.zero_yaw,
-                (90, 110, 130),
-                lambda: not self.yaw_hold,
-            )
-        )
-        # YAW HOLD: independent PI heading-hold. Combines with DEPTH HOLD (they
-        # drive separate axes). Enabled when nothing is driving and yaw is live.
-        self.buttons.append(
-            Button(
-                (806, 734, 150, 36),
-                lambda: "YAW: ON" if self.yaw_hold else "YAW HOLD",
-                self.toggle_yaw_hold,
-                (70, 130, 120),
-                lambda: (
-                    self.yaw_hold
-                    or (
-                        not self.running
-                        and not self.autonomous
-                        and not self.joystick_on
-                        and self.effective_yaw() is not None
-                    )
-                ),
-            )
-        )
         # AUTONOMOUS toggle: YOLO box -> strategy brain -> thrusters.
         # Enabled only with the brain imported + YOLO running; always toggle-OFF-able.
         self.buttons.append(
@@ -1328,7 +1124,6 @@ class App:
                         (not self.running)
                         and not self.joystick_on
                         and not self.depth_hold
-                        and not self.yaw_hold
                         and HAVE_STRATEGY
                         and self.video.yolo_on
                     )
@@ -1439,8 +1234,7 @@ class App:
                 json.dump(data, f, indent=2)
             self._gains_dirty = False
             self.panel_status = (
-                f"saved  yaw {data['yaw_kp']:.5f}/{data['orbit_yaw_kp']:.5f}  "
-                f"heave {data['heave_kp']:.5f}/{data['orbit_heave_kp']:.5f}"
+                f"saved  yaw_kp={data['yaw_kp']:.5f}  heave_kp={data['heave_kp']:.5f}"
             )
         except OSError as e:
             self.panel_status = f"write failed: {e}"
@@ -1487,7 +1281,6 @@ class App:
     def reset_tags(self):
         """Clear the collected unique tags and un-latch mission complete."""
         self.collected_tags.clear()
-        self.seen_near = False
         self.mission_complete = False
         self.celebrate_until = 0.0
         self.set_status("tag collection reset (0 collected)")
@@ -1511,28 +1304,23 @@ class App:
         else:
             self.set_status(f">>> COMPLETE ({len(got)} tags) - no pad connected")
 
-    def is_flashing(self):
-        """True when the light is in blink/flash mode right now -- the SINGLE gate
-        current_light() uses, reused so the tag CSV can record when the LEDs
-        flashed. Flash needs >=1 tag within TAG_NEAR_M (1 m): the win celebration
-        overrides everything; else while autonomous, blink only while a close tag
-        is in view; else TAG FLASH blinks only while a close tag is in view."""
-        if time.time() < self.celebrate_until:
-            return True
-        near = self.video.any_tag_near()  # >=1 tag under 1 m right now
-        if self.autonomous:
-            return near
-        return self.tag_flash and near
-
     def current_light(self):
-        """PWM to put in the packet's light channel right now. Blinks whenever
-        is_flashing() is true; during a hunt the manual LIGHT toggle is ignored;
-        otherwise the manual LIGHT toggle wins."""
-        blink = LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF  # ~4 Hz
-        if self.is_flashing():
-            return blink
+        """PWM to put in the packet's light channel right now.
+        Priority: the win celebration flash overrides everything; then, while
+        autonomous, the light stays off; otherwise TAG FLASH blinks when a tag is
+        seen, else the manual LIGHT toggle wins.
+        """
+        if time.time() < self.celebrate_until:
+            # ~4 Hz celebration blink
+            return LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF
+        # While autonomous the light stays off: LIGHT/TAG FLASH are greyed out and
+        # don't affect the win, so the win celebration above is the only light
+        # event during a hunt.
         if self.autonomous:
-            return LIGHT_OFF  # during a hunt, no steady manual light
+            return LIGHT_OFF
+        if self.tag_flash and self.video.get_tag_ids():
+            # ~4 Hz blink: on/off every 0.25 s
+            return LIGHT_ON if int(time.time() * 4) % 2 == 0 else LIGHT_OFF
         return LIGHT_ON if self.light_on else LIGHT_OFF
 
     # ---- autonomous chase & orbit (topside): YOLO box -> Strategy -> thrusters ----
@@ -1553,7 +1341,6 @@ class App:
         # from the sim unchanged.
         # Fresh collection each run: restarting autonomy clears any latched tags.
         self.collected_tags.clear()
-        self.seen_near = False
         self.mission_complete = False
         self.celebrate_until = 0.0
         self.strategy = Strategy(camera_width=640, camera_height=480)
@@ -1803,34 +1590,6 @@ class App:
         self.set_status(f"depth zeroed (raw {sv[0] * 100:+.1f} cm -> 0)")
         self.add_log("depth zeroed at surface")
 
-    # ---- yaw helpers (circular: everything wraps to +-180 deg) ----
-    @staticmethod
-    def _wrap180(a):
-        """Wrap an angle in degrees to [-180, 180)."""
-        return (a + 180.0) % 360.0 - 180.0
-
-    def _yaw_error(self, target, current):
-        """Shortest signed angle (deg, [-180,180]) to turn from current to target."""
-        return self._wrap180(target - current)
-
-    def effective_yaw(self):
-        """Tared heading in degrees, wrapped to [-180,180] relative to ZERO YAW.
-        None if there's no fresh sensor data."""
-        sv = self.sensors.get()
-        if sv is None:
-            return None
-        return self._wrap180(sv[1] - self.yaw_zero)
-
-    def zero_yaw(self):
-        """Snapshot the current raw heading as the new 0 (press pointed at your 0)."""
-        sv = self.sensors.get()
-        if sv is None:
-            self.set_status("ZERO YAW failed - no sensor data")
-            return
-        self.yaw_zero = sv[1]
-        self.set_status(f"yaw zeroed (raw {sv[1]:+.1f} deg -> 0)")
-        self.add_log("yaw zeroed")
-
     # ---- depth hold (independent PI mode) ----
     def toggle_depth_hold(self):
         if self.depth_hold:
@@ -1853,85 +1612,42 @@ class App:
 
     def _stop_depth_hold(self):
         self.depth_hold = False
-        self._hold_i = 0.0
-        if not self.yaw_hold:  # nothing else holding -> settle to neutral
-            for _ in range(5):
-                try:
-                    self.sock.sendto(
-                        neutral_packet(self.current_light()), self.thr_addr
-                    )
-                except Exception:
-                    pass
-            self.set_status("DEPTH HOLD off - neutral sent")
-        else:
-            self.set_status("DEPTH HOLD off - yaw hold still on")
+        for _ in range(5):
+            try:
+                self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
+            except Exception:
+                pass
+        self.set_status("DEPTH HOLD off - neutral sent")
         self.add_log("depth hold OFF")
 
-    # ---- combined depth + yaw hold ----
-    # Depth PI drives heave, yaw PI drives yaw -- independent axes, so whichever
-    # is/are on are merged into ONE packet by step_holds(). The per-axis helpers
-    # only COMPUTE their command (and manage their own integrator); step_holds
-    # does the single send, so the two loops never stomp each other's channels.
-    def _depth_hold_step(self, dt):
-        """PI heave to hold effective_depth() at hold_target. Returns heave in
-        [-1,1]; 0 with the integrator reset if depth data is missing.
-        heave sign: + == up (shallower), - == down. err = depth - target, so
-        err > 0 (too deep) -> positive heave (up); I trims the steady down-bias
-        this positively-buoyant sub needs."""
+    def step_depth_hold(self, now):
+        """One PI step: hold effective_depth() at hold_target and send the packet.
+        heave sign: + == up (shallower), - == down (deeper). err = depth - target,
+        so err > 0 (too deep) -> positive heave (up); the integral trims the steady
+        down-bias this positively-buoyant sub needs. If depth data drops out we send
+        neutral (the sub then drifts UP, away from the floor) and reset the integrator."""
         d = self.effective_depth()
         if d is None:
             self._hold_i = 0.0
-            return 0.0
+            try:
+                self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
+            except Exception:
+                pass
+            self.set_status("DEPTH HOLD - no depth data, neutral")
+            return
+        dt = (now - self._hold_last_t) if self._hold_last_t else 0.0
+        self._hold_last_t = now
         err = d - self.hold_target
-        # integrate only outside the deadband, so sensor noise / mm-drift can't
-        # make it hunt; the integrator HOLDS its value inside the band.
+        # integrate only outside the deadband, so sensor noise / mm-drift can't make
+        # it hunt; the integrator HOLDS its value inside the band (keeps the trim).
         if dt > 0.0 and abs(err) >= HOLD_DEADBAND:
             self._hold_i += err * dt
-            if HOLD_KI > 0.0:  # clamp the integrator to its heave budget
+            if HOLD_KI > 0.0:  # clamp the integrator to its heave budget (anti-windup)
                 i_cap = HOLD_I_LIMIT / HOLD_KI
                 self._hold_i = max(-i_cap, min(i_cap, self._hold_i))
         i_term = max(-HOLD_I_LIMIT, min(HOLD_I_LIMIT, HOLD_KI * self._hold_i))
-        return clamp(HOLD_KP * err + i_term)
-
-    def _yaw_hold_step(self, dt):
-        """PI yaw to hold effective_yaw() at yaw_target via the shortest signed
-        angle. Returns yaw in [-1,1]; 0 with the integrator reset if yaw data is
-        missing. YAW_CW_IS_POSITIVE flips the output sign to match the sub."""
-        y = self.effective_yaw()
-        if y is None:
-            self._yaw_hold_i = 0.0
-            return 0.0
-        err = self._yaw_error(self.yaw_target, y)  # wrapped to [-180,180]
-        # TRUE deadband: within +-YAW_HOLD_DEADBAND of the heading, command nothing
-        # AND discharge the integrator. This stops noise-nudging and, crucially,
-        # dumps any windup built up during the slew so it doesn't keep yawing once
-        # it's on target. (Depth hold instead HOLDS its integral in the band, since
-        # buoyancy needs constant trim -- yaw has no such steady load.)
-        if abs(err) < YAW_HOLD_DEADBAND:
-            self._yaw_hold_i = 0.0
-            return 0.0
-        if dt > 0.0:
-            self._yaw_hold_i += err * dt
-            if YAW_HOLD_KI > 0.0:  # anti-windup clamp
-                i_cap = YAW_HOLD_I_LIMIT / YAW_HOLD_KI
-                self._yaw_hold_i = max(-i_cap, min(i_cap, self._yaw_hold_i))
-        i_term = max(
-            -YAW_HOLD_I_LIMIT, min(YAW_HOLD_I_LIMIT, YAW_HOLD_KI * self._yaw_hold_i)
-        )
-        cmd = YAW_HOLD_KP * err + i_term
-        return clamp(cmd if YAW_CW_IS_POSITIVE else -cmd)
-
-    def step_holds(self, now):
-        """One control step for whichever hold(s) are active. Merges depth (heave)
-        and yaw into a single packet. Depth + yaw share one sensor packet, so if it
-        drops out both integrators reset and we send neutral (the sub then drifts
-        UP, away from the floor). STOP is always the backstop."""
-        dt = (now - self._hold_last_t) if self._hold_last_t else 0.0
-        self._hold_last_t = now
-        have = self.sensors.get() is not None
-        heave = self._depth_hold_step(dt) if self.depth_hold else 0.0
-        yaw = self._yaw_hold_step(dt) if self.yaw_hold else 0.0
-        thr = mix(0.0, 0.0, heave, yaw)  # holds drive heave + yaw only
+        heave = clamp(HOLD_KP * err + i_term)
+        thr = mix(0.0, 0.0, heave, 0.0)  # depth only -- no surge/strafe/yaw
         try:
             self.sock.sendto(
                 thruster_packet(thr, self.amp, self.current_light()), self.thr_addr
@@ -1939,57 +1655,7 @@ class App:
         except Exception:
             pass
         with self.lock:
-            self.auto_cmd = (0.0, 0.0, heave, yaw)  # for the on-screen readout
-        if not have:
-            self.set_status("HOLD - no sensor data, neutral")
-
-    # ---- yaw hold (independent PI mode; combines with depth hold) ----
-    def toggle_yaw_hold(self):
-        if self.yaw_hold:
-            self._stop_yaw_hold()
-        elif not self.running and not self.autonomous and not self.joystick_on:
-            self._start_yaw_hold()
-
-    def _start_yaw_hold(self):
-        if self.effective_yaw() is None:
-            self.set_status("YAW HOLD needs sensor data - not started")
-            return
-        if self.yaw_target_active:
-            self.commit_yaw_target()
-        self._yaw_hold_i = 0.0  # fresh integrator each engage
-        self._hold_last_t = time.time()  # shared dt clock
-        self.yaw_hold = True
-        self.abort = False
-        self.set_status(f">>> YAW HOLD @ {self.yaw_target:.1f} deg")
-        self.add_log(f"yaw hold ON  target {self.yaw_target:.1f} deg")
-
-    def _stop_yaw_hold(self):
-        self.yaw_hold = False
-        self._yaw_hold_i = 0.0
-        if not self.depth_hold:  # nothing else holding -> settle to neutral
-            for _ in range(5):
-                try:
-                    self.sock.sendto(
-                        neutral_packet(self.current_light()), self.thr_addr
-                    )
-                except Exception:
-                    pass
-            self.set_status("YAW HOLD off - neutral sent")
-        else:
-            self.set_status("YAW HOLD off - depth hold still on")
-        self.add_log("yaw hold OFF")
-
-    def yaw_target_editable(self):
-        """The heading target is this mode's control, so it stays editable even
-        while holding (retype to slew to a new heading); locked only during a test."""
-        return not self.running
-
-    def commit_yaw_target(self):
-        v = self._parse_float(self.yaw_target_text, self.yaw_target)
-        v = self._wrap180(v)  # keep the target in [-180, 180]
-        self.yaw_target = v
-        self.yaw_target_text = f"{v:.1f}"
-        self.yaw_target_active = False
+            self.auto_cmd = (0.0, 0.0, heave, 0.0)  # reuse for the on-screen readout
 
     def hold_target_editable(self):
         """The hold target is this mode's control, so it stays editable even while
@@ -2045,8 +1711,6 @@ class App:
             self.commit_depth_max()
         if self.hold_target_active and keep != "hold":
             self.commit_hold_target()
-        if self.yaw_target_active and keep != "yaw":
-            self.commit_yaw_target()
 
     def _draw_num_box(self, s, rect, active, editable, text, value_str):
         """Small text-box renderer shared by the depth min/max fields (same look
@@ -2088,7 +1752,6 @@ class App:
         self.autonomous = False  # kills the autonomy loop too
         self.joystick_on = False  # and manual gamepad control
         self.depth_hold = False  # and depth hold
-        self.yaw_hold = False  # and yaw hold
         for _ in range(5):
             self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
         self.set_status("STOP - neutral sent")
@@ -2207,13 +1870,6 @@ class App:
                         self._commit_text_boxes(keep="hold")
                         self.hold_target_active = True
                         continue
-                    if (
-                        self.yaw_target_rect.collidepoint(e.pos)
-                        and self.yaw_target_editable()
-                    ):
-                        self._commit_text_boxes(keep="yaw")
-                        self.yaw_target_active = True
-                        continue
                     self._commit_text_boxes()  # clicked elsewhere -> commit any box
                     # Tune-panel sliders take the click before buttons; they don't
                     # overlap (sliders sit in the scroll band, buttons in header).
@@ -2284,16 +1940,6 @@ class App:
                         self.hold_target_text = self.hold_target_text[:-1]
                     elif e.unicode in "0123456789.-" and len(self.hold_target_text) < 6:
                         self.hold_target_text += e.unicode
-                if e.type == pygame.KEYDOWN and self.yaw_target_active:
-                    if e.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
-                        self.commit_yaw_target()
-                    elif e.key == pygame.K_ESCAPE:
-                        self.yaw_target_text = f"{self.yaw_target:.1f}"
-                        self.yaw_target_active = False
-                    elif e.key == pygame.K_BACKSPACE:
-                        self.yaw_target_text = self.yaw_target_text[:-1]
-                    elif e.unicode in "0123456789.-" and len(self.yaw_target_text) < 6:
-                        self.yaw_target_text += e.unicode
                 # ---- gamepad: D-pad steps amp, X/B toggle light/tag-flash ----
                 if (
                     e.type == pygame.JOYHATMOTION
@@ -2315,9 +1961,6 @@ class App:
             # seen together -- each new ID is remembered until RESET TAGS.
             # Reaching tag_target flashes the lights and hands off to the pad.
             if self.autonomous and not self.mission_complete:
-                # Collect every detected tag at ANY range into memory. Completion
-                # still needs at least one tag seen within 1 m (seen_near), so tags
-                # only ever glimpsed from afar can't end the mission.
                 ids = self.video.get_tag_ids()
                 if ids:
                     before = len(self.collected_tags)
@@ -2327,23 +1970,17 @@ class App:
                             f"unique tags {len(self.collected_tags)}/{self.tag_target}: "
                             f"{sorted(self.collected_tags)}"
                         )
-                if self.video.any_tag_near():
-                    self.seen_near = True  # latch the first close sighting
-                if len(self.collected_tags) >= self.tag_target and self.seen_near:
-                    self._complete_mission()
+                    if len(self.collected_tags) >= self.tag_target:
+                        self._complete_mission()
             # idle keep-alive / manual drive: when NOT running a test and NOT
             # autonomous, either drive from the pad (which also serves as the
             # server keep-alive) or send neutral packets carrying the current
             # light value. Keeps LIGHT / TAG FLASH live and satisfies the
             # server's 0.5s watchdog. ~20-30 Hz is plenty.
-            # keep the video logger's view of the LED state current, so the tag
-            # CSV's led_flashed column reflects whether the LEDs were flashing when
-            # each close tag was logged.
-            self.video.led_flashing = self.is_flashing()
             now = time.time()
             if not self.running and not self.autonomous:
-                if self.depth_hold or self.yaw_hold:
-                    self.step_holds(now)  # depth/yaw PI drives + keeps link alive
+                if self.depth_hold:
+                    self.step_depth_hold(now)  # PI loop drives + keeps the link alive
                     last_keepalive = now
                 elif self.joystick_on and self.joy is not None:
                     self.send_joystick()
@@ -2369,7 +2006,6 @@ class App:
         self.autonomous = False
         self.joystick_on = False
         self.depth_hold = False
-        self.yaw_hold = False
         try:
             self.sock.sendto(neutral_packet(), self.thr_addr)
         except Exception:
@@ -2462,42 +2098,21 @@ class App:
                 self.f_small.render("\u25cf REC", True, (255, 80, 80)),
                 (self.vid_rect.x + 8, self.vid_rect.y + 8),
             )
-        if self.depth_hold or self.yaw_hold:
-            hv, yw = self.auto_cmd[2], self.auto_cmd[3]
+        if self.depth_hold:
+            hv = self.auto_cmd[2]
             d = self.effective_depth()
-            y = self.effective_yaw()
-            if self.depth_hold and self.yaw_hold:
-                title = "DEPTH + YAW HOLD"
-            elif self.depth_hold:
-                title = "DEPTH HOLD"
-            else:
-                title = "YAW HOLD"
             s.blit(
-                self.f_status.render(title, True, (120, 220, 210)),
+                self.f_status.render("DEPTH HOLD", True, (120, 220, 210)),
                 (self.vid_rect.x + 8, self.vid_rect.y + 26),
             )
-            line_y = self.vid_rect.y + 52
-            if self.depth_hold:
-                if d is not None:
-                    sub = f"depth  target {self.hold_target:.2f}  now {d:.2f} m  err {d - self.hold_target:+.2f}  heave {hv:+.2f}"
-                else:
-                    sub = "depth  no data - holding neutral"
-                s.blit(
-                    self.f_small.render(sub, True, (150, 200, 220)),
-                    (self.vid_rect.x + 8, line_y),
-                )
-                line_y += 20
-            if self.yaw_hold:
-                if y is not None:
-                    yerr = self._yaw_error(self.yaw_target, y)
-                    sub = f"yaw    target {self.yaw_target:.1f}  now {y:.1f} deg  err {yerr:+.1f}  yaw {yw:+.2f}"
-                else:
-                    sub = "yaw    no data - holding neutral"
-                s.blit(
-                    self.f_small.render(sub, True, (150, 200, 220)),
-                    (self.vid_rect.x + 8, line_y),
-                )
-                line_y += 20
+            if d is not None:
+                sub = f"target {self.hold_target:.2f}  now {d:.2f} m  err {d - self.hold_target:+.2f}  heave {hv:+.2f}"
+            else:
+                sub = "no depth data - holding neutral"
+            s.blit(
+                self.f_small.render(sub, True, (150, 200, 220)),
+                (self.vid_rect.x + 8, self.vid_rect.y + 52),
+            )
         elif self.autonomous:
             s.blit(
                 self.f_status.render(self.auto_state, True, (120, 230, 150)),
@@ -2518,28 +2133,21 @@ class App:
                 ),
                 (self.vid_rect.x + 8, self.vid_rect.y + 52),
             )
-        # AprilTag readout -- id + distance; green if any tag is within 1 m
+        # AprilTag readout
         ids = self.video.get_tag_ids()
-        dists = self.video.get_tag_dists()
-        if ids:
-            parts = [
-                (f"{i} ({dists[i]:.2f}m)" if dists.get(i) is not None else f"{i} (?m)")
-                for i in ids
-            ]
-            tag_txt = "AprilTag IDs: " + ", ".join(parts)
-            near = any(dists.get(i) is not None and dists[i] < TAG_NEAR_M for i in ids)
-            tcol = (120, 230, 120) if near else (230, 200, 120)
-        else:
-            tag_txt, tcol = "AprilTag IDs: none", (150, 150, 150)
-        s.blit(self.f_status.render(tag_txt, True, tcol), (565, 496))
-        # sensor readout (depth = heave, yaw). Both are shown TARED (from ZERO
-        # DEPTH / ZERO YAW); depth is coloured by band: red at/over a limit, amber
-        # within the margin.
+        tag_txt = "AprilTag IDs: " + (", ".join(str(i) for i in ids) if ids else "none")
+        s.blit(
+            self.f_status.render(
+                tag_txt, True, (120, 230, 120) if ids else (150, 150, 150)
+            ),
+            (565, 496),
+        )
+        # sensor readout (depth = heave, yaw). Depth is shown TARED (from ZERO)
+        # and coloured by band: red at/over a limit, amber within the margin.
         sv = self.sensors.get()
         d = self.effective_depth()
         if sv is not None and d is not None:
-            yaw_disp = self._wrap180(sv[1] - self.yaw_zero)  # tared, wrapped to +-180
-            sensor_txt = f"Depth: {d * 100:+.1f} cm    Yaw: {yaw_disp:+.1f} deg"
+            sensor_txt = f"Depth: {d * 100:+.1f} cm    Yaw: {sv[1]:+.1f} deg"
             if d >= self.depth_max or d <= self.depth_min:
                 color = (240, 120, 120)  # out of band -> guard actively pushing
             elif (
@@ -2589,25 +2197,6 @@ class App:
             self.hold_target_editable(),
             self.hold_target_text,
             f"{self.hold_target:.2f}",
-        )
-        # yaw-hold controls (below the depth strip): caption + target box. The
-        # ZERO YAW / YAW HOLD buttons live in self.buttons and draw with the rest.
-        s.blit(
-            self.f_small.render(
-                "Yaw (deg) - HOLD to a set heading (relative to ZERO YAW)",
-                True,
-                (180, 180, 180),
-            ),
-            (372, 718),
-        )
-        s.blit(self.f_small.render("target", True, (180, 180, 180)), (372, 742))
-        self._draw_num_box(
-            s,
-            self.yaw_target_rect,
-            self.yaw_target_active,
-            self.yaw_target_editable(),
-            self.yaw_target_text,
-            f"{self.yaw_target:.1f}",
         )
         # tag-collection: caption + target text box + progress
         s.blit(self.f_small.render("Tags to finish", True, (180, 180, 180)), (372, 534))
@@ -2767,9 +2356,9 @@ def main():
     )
     ap.add_argument("--wifi", action="store_true")
     ap.add_argument(
-        "--weights", default="best.pt", help="YOLOv26 weights to enable detection"
+        "--weights", default=None, help="YOLOv26 weights to enable detection"
     )
-    ap.add_argument("--conf", type=float, default=0.65)
+    ap.add_argument("--conf", type=float, default=0.6)
     ap.add_argument("--yolo-interval", type=int, default=3)
     ap.add_argument(
         "--strategy",

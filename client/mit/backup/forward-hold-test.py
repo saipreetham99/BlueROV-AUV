@@ -7,6 +7,9 @@ Combined topside ROV client (single pygame window):
   * Manual gamepad control (JOYSTICK button): left stick Y surge, right stick Y strafe,
     RT heave up / right-stick-X-left heave down, XBOX/BACK yaw, D-pad amp +/-100,
     X light, B tag-flash. Live whenever autonomy is off. Same mix/packet path.
+  * Depth hold + yaw hold (independent PI loops). With BOTH holding, the latched
+    FORWARD button pushes straight ahead AND logs depth/yaw against their targets
+    to forward_hold_*.csv for tolerance verification.
   * Live video (shown inside the window when the stream is up; "NO VIDEO" otherwise),
     with AprilTag (optional) and YOLO (optional, --weights) overlays and a RECORD button
     that saves the clean stream to mp4.
@@ -382,7 +385,20 @@ LIGHT_ON = 1900
 SENSOR_FMT = "<dff"  # (epoch_time, depth_m, yaw_deg) - matches rov_server.py
 AMP_MIN = 0
 AMP_MAX = 400
+AMP_DEFAULT = 120  # AMP the client starts at (click the AMP box to retype)
+# Thruster speed for the CSV logs: AMP is the +-microsecond swing away from
+# NEUTRAL that a full-scale (+-1.0) command is worth, so it IS the throttle.
+# 0 amp = 0 % (thrusters pinned at neutral), AMP_FULL_SCALE = 100 %.
+AMP_FULL_SCALE = 400.0
 JOY_DEADZONE = 0.12  # ignore small stick drift around center
+
+
+def amp_percent(amp):
+    """AMP as a 0-100 % thruster speed for the logs (0 amp -> 0 %, 400 -> 100 %)."""
+    if AMP_FULL_SCALE <= 0:
+        return 0.0
+    return 100.0 * float(amp) / AMP_FULL_SCALE
+
 
 # ---------- AprilTag distance / pose ----------
 # These are the knobs you change when the tag or the lens changes. TAG_SIZE_M is
@@ -448,6 +464,19 @@ YAW_HOLD_DEADBAND = 2.0  # deg: freeze the integrator within +-2 deg so it won't
 #   on-screen Yaw reading. If it goes UP (more positive), leave this True; if it
 #   goes DOWN, set it False (the ONLY change needed -- the loop keys off it).
 YAW_CW_IS_POSITIVE = False
+
+# ---------- forward-while-holding ----------
+# With DEPTH+YAW hold both running, the sub can also be pushed FORWARD only:
+# the left stick (pull-back ignored) or the latched FORWARD button. Strafe stays
+# 0 and the PI loops keep heave/yaw, so it translates while tracking depth and
+# heading. Speed is the packet's AMP, so set AMP before you press FORWARD.
+HOLD_FWD_SURGE = 1.0  # latched-button surge (0..1), scaled by AMP in the packet
+# Tolerance log: while FORWARD is LATCHED the client writes one CSV per push,
+#   forward_hold_<stamp>_depth<target>m_yaw<target>deg_amp<amp>.csv
+# holding the tared depth/yaw from the IMU/depth sensor, their targets and errors,
+# the commands going into the mixer, and the AMP as a 0-100 % thruster speed --
+# i.e. exactly what you need to show how well the holds tracked while translating.
+FWD_LOG_HZ = 10.0  # rows per second in that CSV (0 = one row per control tick)
 
 
 # ---------- shared thruster core (identical to pool_test.py) ----------
@@ -609,6 +638,7 @@ def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
         from ultralytics import YOLO
 
         model = YOLO(weights)
+        print(f"[yolo] device={model.device}")
     except Exception as e:
         # Report and exit; parent keeps running with video-only.
         try:
@@ -667,6 +697,11 @@ class VideoReceiver(threading.Thread):
         # set by App every frame: True while the light is in flash/blink mode,
         # so the tag CSV can record when the LEDs actually flashed.
         self.led_flashing = False
+        # also set by App every frame: the AMP currently going out in the packets
+        # and the same number as a 0-100 % thruster speed, so every tag row records
+        # how hard the sub was driving when that tag was seen.
+        self.amp_value = AMP_DEFAULT
+        self.thruster_pct = amp_percent(AMP_DEFAULT)
         # open a CSV logging EVERY detection (all modes): id, distance, timestamps
         self.tag_log = None
         if TAG_LOG_ENABLED:
@@ -674,7 +709,8 @@ class VideoReceiver(threading.Thread):
             try:
                 self.tag_log = open(fn, "w")
                 self.tag_log.write(
-                    "t_epoch,iso_time,tag_id,distance_m,under_1m,led_flashed\n"
+                    "t_epoch,iso_time,tag_id,distance_m,under_1m,led_flashed,"
+                    "amp,thruster_pct\n"
                 )
                 self.tag_log.flush()
                 print(f"[tags] logging detections -> {fn}")
@@ -794,18 +830,26 @@ class VideoReceiver(threading.Thread):
                     #   under 1 m: full row (id, distance, under_1m=1) plus whether
                     #     the LEDs were flashing when it was logged.
                     #   over 1 m / unknown range: id + timestamp only, rest blank.
+                    # Both kinds of row carry the AMP and its 0-100 % thruster
+                    # speed, so the sighting can be tied to how hard we were driving.
                     if self.tag_log is not None and self._last_tag_hits:
                         t_epoch = time.time()
                         iso = datetime.now().isoformat(timespec="milliseconds")
                         led = 1 if self.led_flashing else 0
+                        amp_now = int(self.amp_value)
+                        pct_now = float(self.thruster_pct)
                         for _p, _c, tid, dist in self._last_tag_hits:
                             near = dist is not None and dist < TAG_NEAR_M
                             if near:
                                 self.tag_log.write(
-                                    f"{t_epoch:.4f},{iso},{tid},{dist:.4f},1,{led}\n"
+                                    f"{t_epoch:.4f},{iso},{tid},{dist:.4f},1,{led},"
+                                    f"{amp_now},{pct_now:.1f}\n"
                                 )
                             else:
-                                self.tag_log.write(f"{t_epoch:.4f},{iso},{tid},,,\n")
+                                self.tag_log.write(
+                                    f"{t_epoch:.4f},{iso},{tid},,,,"
+                                    f"{amp_now},{pct_now:.1f}\n"
+                                )
                         self.tag_log.flush()
                 ids = self._last_tag_ids
                 # redraw the cached tags every frame (cheap) so the overlay stays
@@ -1039,7 +1083,7 @@ class App:
         self.f_status = pygame.font.SysFont("Helvetica", 20, bold=True)
         # thruster-test settings/state
         self.duration = 3
-        self.amp = 100
+        self.amp = AMP_DEFAULT  # 120 -> 30 % thruster speed
         # AMP is a click-to-type text box now (clamped AMP_MIN..AMP_MAX on commit).
         self.amp_rect = pygame.Rect(200, 90, 130, 36)
         self.amp_text = str(self.amp)
@@ -1085,6 +1129,18 @@ class App:
         self.yaw_target_active = False
         self.yaw_target_rect = pygame.Rect(440, 736, 70, 32)
         self._yaw_hold_i = 0.0
+        # FORWARD while holding: latched full surge (button) and/or forward-only
+        # stick. Cleared by STOP and by either hold turning off.
+        self.hold_forward = False
+        self.hold_surge = 0.0
+        # FORWARD tolerance log: a CSV of depth/yaw vs their targets, opened when
+        # the FORWARD latch goes ON and closed when it goes OFF (or a hold drops,
+        # or STOP). _fwd_stats accumulates mean/max |error| for the summary line.
+        self._fwd_log = None
+        self._fwd_log_name = None
+        self._fwd_log_t0 = 0.0
+        self._fwd_log_last = 0.0
+        self._fwd_stats = None
         self.capture = False
         self.rate = 50.0
         # light state
@@ -1124,6 +1180,8 @@ class App:
         self.video = VideoReceiver(
             self.rov_ip, self.video_port, weights, conf, yolo_interval
         )
+        self.video.amp_value = self.amp
+        self.video.thruster_pct = self.amp_pct()
         self.video.start()
         # sensors (depth + yaw)
         self.sensors = SensorReceiver(self.sensor_port)
@@ -1212,6 +1270,23 @@ class App:
                         and not self.yaw_hold
                     )
                 ),
+            )
+        )
+        # FORWARD: drive straight ahead while BOTH holds run, until STOP.
+        # Speed = AMP, so set AMP first. Press again to stop pushing and go
+        # back to station-keeping without dropping the holds. While latched it
+        # also writes the depth/yaw tolerance CSV (see _start_fwd_log).
+        self.buttons.append(
+            Button(
+                (20, 700, 316, 46),
+                lambda: (
+                    "FORWARD: ON (logging)"
+                    if self.hold_forward
+                    else "FORWARD (hold both)"
+                ),
+                self.toggle_hold_forward,
+                (110, 130, 70),
+                lambda: self.hold_forward or (self.depth_hold and self.yaw_hold),
             )
         )
         # video record button (below the video panel)
@@ -1371,6 +1446,11 @@ class App:
                 f"[autonomy] {_STRATEGY_NAME} not importable ({_STRATEGY_ERR}); "
                 "autonomous mode disabled"
             )
+
+    # ---- thruster speed helper (shared by both CSV logs + the AMP caption) ----
+    def amp_pct(self):
+        """Current AMP as a 0-100 % thruster speed (0 amp -> 0 %, 400 -> 100 %)."""
+        return amp_percent(self.amp)
 
     # ---- tune panel: sliders write strategy_gains.json (brain hot-reloads it) ----
     def toggle_panel(self):
@@ -1568,7 +1648,7 @@ class App:
         self._auto_thread = threading.Thread(target=self._autonomy_worker, daemon=True)
         self._auto_thread.start()
         self.set_status(">>> AUTONOMOUS - chase & orbit")
-        self.add_log(f"autonomous ON  (amp={self.amp})")
+        self.add_log(f"autonomous ON  (amp={self.amp}, {self.amp_pct():.0f}%)")
 
     def _stop_autonomy(self):
         self.autonomous = False
@@ -1683,7 +1763,7 @@ class App:
         self.trig_rest[2] = self.joy.get_axis(2)
         self.joystick_on = True
         self.set_status(">>> JOYSTICK - manual control")
-        self.add_log(f"joystick ON  (amp={self.amp})")
+        self.add_log(f"joystick ON  (amp={self.amp}, {self.amp_pct():.0f}%)")
 
     def _stop_joystick(self):
         self.joystick_on = False
@@ -1853,6 +1933,8 @@ class App:
 
     def _stop_depth_hold(self):
         self.depth_hold = False
+        self.hold_forward = False  # FORWARD needs BOTH holds -> drop the latch
+        self._stop_fwd_log()  # ... and close its tolerance CSV
         self._hold_i = 0.0
         if not self.yaw_hold:  # nothing else holding -> settle to neutral
             for _ in range(5):
@@ -1922,16 +2004,22 @@ class App:
         return clamp(cmd if YAW_CW_IS_POSITIVE else -cmd)
 
     def step_holds(self, now):
-        """One control step for whichever hold(s) are active. Merges depth (heave)
-        and yaw into a single packet. Depth + yaw share one sensor packet, so if it
-        drops out both integrators reset and we send neutral (the sub then drifts
-        UP, away from the floor). STOP is always the backstop."""
+        """One control step for whichever hold(s) are active. Merges depth (heave),
+        yaw, and the forward-only surge into a single packet. Depth + yaw share one
+        sensor packet, so if it drops out both integrators reset and we send
+        neutral (the sub then drifts UP, away from the floor). STOP is always the
+        backstop. While FORWARD is latched this also appends a row to the
+        tolerance CSV."""
         dt = (now - self._hold_last_t) if self._hold_last_t else 0.0
         self._hold_last_t = now
         have = self.sensors.get() is not None
         heave = self._depth_hold_step(dt) if self.depth_hold else 0.0
         yaw = self._yaw_hold_step(dt) if self.yaw_hold else 0.0
-        thr = mix(0.0, 0.0, heave, yaw)  # holds drive heave + yaw only
+        # forward-only surge, whichever source is pushing harder. Never negative
+        # and never any strafe, so the holds keep their axes to themselves.
+        surge = max(HOLD_FWD_SURGE if self.hold_forward else 0.0, self.hold_pad_surge())
+        self.hold_surge = surge
+        thr = mix(surge, 0.0, heave, yaw)  # holds own heave + yaw; surge is ours
         try:
             self.sock.sendto(
                 thruster_packet(thr, self.amp, self.current_light()), self.thr_addr
@@ -1939,9 +2027,150 @@ class App:
         except Exception:
             pass
         with self.lock:
-            self.auto_cmd = (0.0, 0.0, heave, yaw)  # for the on-screen readout
+            self.auto_cmd = (surge, 0.0, heave, yaw)  # for the on-screen readout
+        # tolerance log (only open while FORWARD is latched); reads the sensors
+        # once more so the row carries exactly what the loops were given.
+        if self._fwd_log is not None:
+            self._log_fwd_row(
+                now, self.effective_depth(), self.effective_yaw(), surge, heave, yaw
+            )
         if not have:
             self.set_status("HOLD - no sensor data, neutral")
+
+    # ---- forward while holding (stick or latched button) ----
+    def toggle_hold_forward(self):
+        """Latch/unlatch the straight-ahead push. Only arms with BOTH holds on.
+        Latching also opens the depth/yaw tolerance CSV; unlatching closes it."""
+        if self.hold_forward:
+            self.hold_forward = False
+            self._stop_fwd_log()
+            self.set_status("FORWARD off - station keeping")
+            self.add_log("hold-forward OFF")
+        elif self.depth_hold and self.yaw_hold:
+            self.hold_forward = True
+            self._start_fwd_log()
+            self.set_status(
+                f">>> FORWARD (amp {self.amp}, {self.amp_pct():.0f}%) - depth+yaw held"
+            )
+            self.add_log(f"hold-forward ON  amp={self.amp} ({self.amp_pct():.0f}%)")
+
+    # ---- FORWARD tolerance log (depth + yaw vs target while pushing ahead) ----
+    def _start_fwd_log(self):
+        """Open this push's CSV. One row every 1/FWD_LOG_HZ s with the tared
+        depth/yaw from the sub, their targets and errors, the commands going into
+        the mixer, and AMP as a 0-100 % thruster speed. Filename carries both
+        targets and the AMP so runs can't be mixed up afterwards."""
+        if self._fwd_log is not None:
+            return
+        fn = (
+            f"forward_hold_{datetime.now():%Y%m%d_%H%M%S}"
+            f"_depth{self.hold_target:.2f}m"
+            f"_yaw{self.yaw_target:.1f}deg"
+            f"_amp{self.amp}.csv"
+        )
+        try:
+            f = open(fn, "w")
+        except OSError as e:
+            self.add_log(f"forward log failed: {e}")
+            print(f"[fwd] log open failed ({e}) - logging off")
+            return
+        f.write(
+            "t_epoch,iso_time,t_elapsed_s,"
+            "depth_m,depth_target_m,depth_err_m,"
+            "yaw_deg,yaw_target_deg,yaw_err_deg,"
+            "surge_cmd,heave_cmd,yaw_cmd,amp,thruster_pct\n"
+        )
+        f.flush()
+        self._fwd_log = f
+        self._fwd_log_name = fn
+        self._fwd_log_t0 = time.time()
+        self._fwd_log_last = 0.0
+        # running tolerance stats -> the mean/max |error| summary printed on close
+        self._fwd_stats = {
+            "n": 0,
+            "d_sum": 0.0,
+            "d_max": 0.0,
+            "y_sum": 0.0,
+            "y_max": 0.0,
+        }
+        print(f"[fwd] logging -> {fn}")
+        self.add_log(f"forward log -> {fn}")
+
+    def _log_fwd_row(self, now, depth, yaw, surge, heave, yaw_cmd):
+        """Append one rate-limited row while FORWARD is latched. Missing sensor
+        data leaves the measured/error fields blank rather than faking a zero."""
+        if self._fwd_log is None:
+            return
+        # small epsilon: the caller ticks at 30 Hz (33.3 ms), so an exact 100 ms
+        # gate would land just short every third frame and log at 7.5 Hz instead.
+        if FWD_LOG_HZ > 0 and (now - self._fwd_log_last) < (1.0 / FWD_LOG_HZ) - 0.005:
+            return
+        self._fwd_log_last = now
+        d_err = None if depth is None else depth - self.hold_target
+        y_err = None if yaw is None else self._yaw_error(self.yaw_target, yaw)
+        st = self._fwd_stats
+        if st is not None and d_err is not None and y_err is not None:
+            st["n"] += 1
+            st["d_sum"] += abs(d_err)
+            st["d_max"] = max(st["d_max"], abs(d_err))
+            st["y_sum"] += abs(y_err)
+            st["y_max"] = max(st["y_max"], abs(y_err))
+        d_txt = "" if depth is None else f"{depth:.4f}"
+        de_txt = "" if d_err is None else f"{d_err:+.4f}"
+        y_txt = "" if yaw is None else f"{yaw:.2f}"
+        ye_txt = "" if y_err is None else f"{y_err:+.2f}"
+        iso = datetime.now().isoformat(timespec="milliseconds")
+        try:
+            self._fwd_log.write(
+                f"{now:.4f},{iso},{now - self._fwd_log_t0:.3f},"
+                f"{d_txt},{self.hold_target:.4f},{de_txt},"
+                f"{y_txt},{self.yaw_target:.2f},{ye_txt},"
+                f"{surge:+.3f},{heave:+.3f},{yaw_cmd:+.3f},"
+                f"{self.amp},{self.amp_pct():.1f}\n"
+            )
+            self._fwd_log.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _stop_fwd_log(self):
+        """Close the CSV and report the tolerance the holds actually kept."""
+        if self._fwd_log is None:
+            return
+        st = self._fwd_stats or {}
+        n = st.get("n", 0)
+        name = self._fwd_log_name
+        try:
+            self._fwd_log.close()
+        except OSError:
+            pass
+        self._fwd_log = None
+        self._fwd_log_name = None
+        self._fwd_stats = None
+        if n:
+            d_mean = st["d_sum"] / n
+            y_mean = st["y_sum"] / n
+            d_max = st["d_max"]
+            y_max = st["y_max"]
+            msg = (
+                f"tol: depth mean {d_mean * 100:.1f} max {d_max * 100:.1f} cm  "
+                f"yaw mean {y_mean:.1f} max {y_max:.1f} deg  ({n} rows)"
+            )
+            self.add_log(msg)
+            print(f"[fwd] {msg}")
+        print(f"[fwd] saved {name}")
+        self.add_log(f"forward log saved: {name}")
+
+    def hold_pad_surge(self):
+        """Forward-ONLY surge from the left stick, live whenever a hold is running
+        -- no JOYSTICK: ON needed. Pull-back and the deadzone both read as 0, so
+        the pad can never reverse, strafe, or fight the hold loops."""
+        if self.joy is None:
+            return 0.0
+        try:
+            v = -self.joy.get_axis(1)  # stick up -> forward
+        except pygame.error:
+            return 0.0
+        return clamp(v) if v >= JOY_DEADZONE else 0.0
 
     # ---- yaw hold (independent PI mode; combines with depth hold) ----
     def toggle_yaw_hold(self):
@@ -1965,6 +2194,8 @@ class App:
 
     def _stop_yaw_hold(self):
         self.yaw_hold = False
+        self.hold_forward = False  # FORWARD needs BOTH holds -> drop the latch
+        self._stop_fwd_log()  # ... and close its tolerance CSV
         self._yaw_hold_i = 0.0
         if not self.depth_hold:  # nothing else holding -> settle to neutral
             for _ in range(5):
@@ -2089,6 +2320,8 @@ class App:
         self.joystick_on = False  # and manual gamepad control
         self.depth_hold = False  # and depth hold
         self.yaw_hold = False  # and yaw hold
+        self.hold_forward = False  # and the latched forward push
+        self._stop_fwd_log()  # ... closing its tolerance CSV cleanly
         for _ in range(5):
             self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
         self.set_status("STOP - neutral sent")
@@ -2098,7 +2331,9 @@ class App:
         cmd[motion] = float(sign)
         thr = mix(cmd["surge"], cmd["strafe"], cmd["heave"], cmd["yaw"])
         label = f"{motion} {'+' if sign > 0 else '-'}"
-        self.add_log(f"{label}  amp={self.amp}  {self.duration}s")
+        self.add_log(
+            f"{label}  amp={self.amp} ({self.amp_pct():.0f}%)  {self.duration}s"
+        )
         recording = self.capture
         if recording:
             fname = f"capture_{motion}_{'+' if sign > 0 else '-'}_{time.strftime('%H%M%S')}.csv"
@@ -2338,8 +2573,11 @@ class App:
             # server's 0.5s watchdog. ~20-30 Hz is plenty.
             # keep the video logger's view of the LED state current, so the tag
             # CSV's led_flashed column reflects whether the LEDs were flashing when
-            # each close tag was logged.
+            # each close tag was logged -- and its view of AMP / thruster %, so the
+            # same rows record how hard the sub was driving.
             self.video.led_flashing = self.is_flashing()
+            self.video.amp_value = self.amp
+            self.video.thruster_pct = self.amp_pct()
             now = time.time()
             if not self.running and not self.autonomous:
                 if self.depth_hold or self.yaw_hold:
@@ -2370,6 +2608,8 @@ class App:
         self.joystick_on = False
         self.depth_hold = False
         self.yaw_hold = False
+        self.hold_forward = False
+        self._stop_fwd_log()  # flush + close the tolerance CSV on exit
         try:
             self.sock.sendto(neutral_packet(), self.thr_addr)
         except Exception:
@@ -2388,9 +2628,15 @@ class App:
             ),
             (20, 16),
         )
-        # captions + values for duration stepper
+        # captions + values for duration stepper. The AMP caption also shows the
+        # thruster speed that AMP is worth (the number written to both CSV logs).
         s.blit(self.f_small.render("Duration", True, (180, 180, 180)), (20, 70))
-        s.blit(self.f_small.render("AMP (0-400)", True, (180, 180, 180)), (200, 70))
+        s.blit(
+            self.f_small.render(
+                f"AMP (0-400)  {self.amp_pct():.0f}%", True, (180, 180, 180)
+            ),
+            (200, 70),
+        )
         s.blit(
             self.f_status.render(f"{self.duration}s", True, (255, 255, 255)), (66, 92)
         )
@@ -2495,6 +2741,28 @@ class App:
                     sub = "yaw    no data - holding neutral"
                 s.blit(
                     self.f_small.render(sub, True, (150, 200, 220)),
+                    (self.vid_rect.x + 8, line_y),
+                )
+                line_y += 20
+            # forward-only surge line: latched button or the pad's stick
+            if self.hold_forward or self.hold_surge > 0.0:
+                src = "FORWARD latched" if self.hold_forward else "pad stick"
+                s.blit(
+                    self.f_small.render(
+                        f"surge  {self.hold_surge:+.2f}  ({src}, "
+                        f"{self.amp_pct():.0f}% thrust)",
+                        True,
+                        (180, 220, 150),
+                    ),
+                    (self.vid_rect.x + 8, line_y),
+                )
+                line_y += 20
+            # tolerance CSV indicator while the FORWARD log is open
+            if self._fwd_log is not None:
+                s.blit(
+                    self.f_small.render(
+                        f"\u25cf LOG  {self._fwd_log_name}", True, (255, 170, 170)
+                    ),
                     (self.vid_rect.x + 8, line_y),
                 )
                 line_y += 20

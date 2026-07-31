@@ -449,6 +449,13 @@ YAW_HOLD_DEADBAND = 2.0  # deg: freeze the integrator within +-2 deg so it won't
 #   goes DOWN, set it False (the ONLY change needed -- the loop keys off it).
 YAW_CW_IS_POSITIVE = False
 
+# ---------- forward-while-holding ----------
+# With DEPTH+YAW hold both running, the sub can also be pushed FORWARD only:
+# the left stick (pull-back ignored) or the latched FORWARD button. Strafe stays
+# 0 and the PI loops keep heave/yaw, so it translates while tracking depth and
+# heading. Speed is the packet's AMP, so set AMP before you press FORWARD.
+HOLD_FWD_SURGE = 1.0  # latched-button surge (0..1), scaled by AMP in the packet
+
 
 # ---------- shared thruster core (identical to pool_test.py) ----------
 def clamp(x):
@@ -609,6 +616,7 @@ def _yolo_worker(weights, conf, in_q, out_q, stop_ev):
         from ultralytics import YOLO
 
         model = YOLO(weights)
+        print(f"[yolo] device={model.device}")
     except Exception as e:
         # Report and exit; parent keeps running with video-only.
         try:
@@ -1085,6 +1093,10 @@ class App:
         self.yaw_target_active = False
         self.yaw_target_rect = pygame.Rect(440, 736, 70, 32)
         self._yaw_hold_i = 0.0
+        # FORWARD while holding: latched full surge (button) and/or forward-only
+        # stick. Cleared by STOP and by either hold turning off.
+        self.hold_forward = False
+        self.hold_surge = 0.0
         self.capture = False
         self.rate = 50.0
         # light state
@@ -1212,6 +1224,18 @@ class App:
                         and not self.yaw_hold
                     )
                 ),
+            )
+        )
+        # FORWARD: drive straight ahead while BOTH holds run, until STOP.
+        # Speed = AMP, so set AMP first. Press again to stop pushing and go
+        # back to station-keeping without dropping the holds.
+        self.buttons.append(
+            Button(
+                (20, 700, 316, 46),
+                lambda: "FORWARD: ON" if self.hold_forward else "FORWARD (hold both)",
+                self.toggle_hold_forward,
+                (110, 130, 70),
+                lambda: self.hold_forward or (self.depth_hold and self.yaw_hold),
             )
         )
         # video record button (below the video panel)
@@ -1853,6 +1877,7 @@ class App:
 
     def _stop_depth_hold(self):
         self.depth_hold = False
+        self.hold_forward = False  # FORWARD needs BOTH holds -> drop the latch
         self._hold_i = 0.0
         if not self.yaw_hold:  # nothing else holding -> settle to neutral
             for _ in range(5):
@@ -1922,16 +1947,21 @@ class App:
         return clamp(cmd if YAW_CW_IS_POSITIVE else -cmd)
 
     def step_holds(self, now):
-        """One control step for whichever hold(s) are active. Merges depth (heave)
-        and yaw into a single packet. Depth + yaw share one sensor packet, so if it
-        drops out both integrators reset and we send neutral (the sub then drifts
-        UP, away from the floor). STOP is always the backstop."""
+        """One control step for whichever hold(s) are active. Merges depth (heave),
+        yaw, and the forward-only surge into a single packet. Depth + yaw share one
+        sensor packet, so if it drops out both integrators reset and we send
+        neutral (the sub then drifts UP, away from the floor). STOP is always the
+        backstop."""
         dt = (now - self._hold_last_t) if self._hold_last_t else 0.0
         self._hold_last_t = now
         have = self.sensors.get() is not None
         heave = self._depth_hold_step(dt) if self.depth_hold else 0.0
         yaw = self._yaw_hold_step(dt) if self.yaw_hold else 0.0
-        thr = mix(0.0, 0.0, heave, yaw)  # holds drive heave + yaw only
+        # forward-only surge, whichever source is pushing harder. Never negative
+        # and never any strafe, so the holds keep their axes to themselves.
+        surge = max(HOLD_FWD_SURGE if self.hold_forward else 0.0, self.hold_pad_surge())
+        self.hold_surge = surge
+        thr = mix(surge, 0.0, heave, yaw)  # holds own heave + yaw; surge is ours
         try:
             self.sock.sendto(
                 thruster_packet(thr, self.amp, self.current_light()), self.thr_addr
@@ -1939,9 +1969,33 @@ class App:
         except Exception:
             pass
         with self.lock:
-            self.auto_cmd = (0.0, 0.0, heave, yaw)  # for the on-screen readout
+            self.auto_cmd = (surge, 0.0, heave, yaw)  # for the on-screen readout
         if not have:
             self.set_status("HOLD - no sensor data, neutral")
+
+    # ---- forward while holding (stick or latched button) ----
+    def toggle_hold_forward(self):
+        """Latch/unlatch the straight-ahead push. Only arms with BOTH holds on."""
+        if self.hold_forward:
+            self.hold_forward = False
+            self.set_status("FORWARD off - station keeping")
+            self.add_log("hold-forward OFF")
+        elif self.depth_hold and self.yaw_hold:
+            self.hold_forward = True
+            self.set_status(f">>> FORWARD (amp {self.amp}) - depth+yaw held")
+            self.add_log(f"hold-forward ON  amp={self.amp}")
+
+    def hold_pad_surge(self):
+        """Forward-ONLY surge from the left stick, live whenever a hold is running
+        -- no JOYSTICK: ON needed. Pull-back and the deadzone both read as 0, so
+        the pad can never reverse, strafe, or fight the hold loops."""
+        if self.joy is None:
+            return 0.0
+        try:
+            v = -self.joy.get_axis(1)  # stick up -> forward
+        except pygame.error:
+            return 0.0
+        return clamp(v) if v >= JOY_DEADZONE else 0.0
 
     # ---- yaw hold (independent PI mode; combines with depth hold) ----
     def toggle_yaw_hold(self):
@@ -1965,6 +2019,7 @@ class App:
 
     def _stop_yaw_hold(self):
         self.yaw_hold = False
+        self.hold_forward = False  # FORWARD needs BOTH holds -> drop the latch
         self._yaw_hold_i = 0.0
         if not self.depth_hold:  # nothing else holding -> settle to neutral
             for _ in range(5):
@@ -2089,6 +2144,7 @@ class App:
         self.joystick_on = False  # and manual gamepad control
         self.depth_hold = False  # and depth hold
         self.yaw_hold = False  # and yaw hold
+        self.hold_forward = False  # and the latched forward push
         for _ in range(5):
             self.sock.sendto(neutral_packet(self.current_light()), self.thr_addr)
         self.set_status("STOP - neutral sent")
@@ -2370,6 +2426,7 @@ class App:
         self.joystick_on = False
         self.depth_hold = False
         self.yaw_hold = False
+        self.hold_forward = False
         try:
             self.sock.sendto(neutral_packet(), self.thr_addr)
         except Exception:
@@ -2495,6 +2552,16 @@ class App:
                     sub = "yaw    no data - holding neutral"
                 s.blit(
                     self.f_small.render(sub, True, (150, 200, 220)),
+                    (self.vid_rect.x + 8, line_y),
+                )
+                line_y += 20
+            # forward-only surge line: latched button or the pad's stick
+            if self.hold_forward or self.hold_surge > 0.0:
+                src = "FORWARD latched" if self.hold_forward else "pad stick"
+                s.blit(
+                    self.f_small.render(
+                        f"surge  {self.hold_surge:+.2f}  ({src})", True, (180, 220, 150)
+                    ),
                     (self.vid_rect.x + 8, line_y),
                 )
                 line_y += 20

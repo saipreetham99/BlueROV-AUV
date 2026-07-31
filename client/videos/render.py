@@ -16,6 +16,7 @@ def main():
     args = ap.parse_args()
 
     model = YOLO(args.weights)
+    print(f"[yolo] device={model.device}")
 
     source = 0 if args.video == "0" else args.video
     cap = cv2.VideoCapture(source)
