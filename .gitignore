@@ -4,7 +4,7 @@
 *.mov
 stream_*.mp4
 capture_*.csv
-
+.DS_Store
 # --- Python ---
 __pycache__/
 *.pyc

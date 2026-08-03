@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BlueROV2 Master Technical Handoff Wiki</title>
+    
+    <!-- Mermaid.js for rendering diagrams -->
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script>mermaid.initialize({startOnLoad:true, theme: 'default'});</script>
+
+    <!-- MathJax for formula rendering -->
+    <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+
+    <style>
+        :root {
+            --primary: #0366d6;
+            --primary-dark: #004494;
+            --sidebar-bg: #f8f9fa;
+            --text-main: #24292e;
+            --text-muted: #586069;
+            --code-bg: #1e1e1e;
+            --code-color: #d4d4d4;
+            --accent: #e36209;
+            --highlight: #fffbdd;
+            --border: #e1e4e8;
+            --success: #28a745;
+        }
+
+        * { box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            margin: 0;
+            display: flex;
+            color: var(--text-main);
+            line-height: 1.7;
+            font-size: 16px;
+            background-color: #ffffff;
+        }
+
+        /* Sidebar Navigation */
+        .sidebar {
+            width: 340px;
+            background-color: var(--sidebar-bg);
+            height: 100vh;
+            position: fixed;
+            overflow-y: auto;
+            border-right: 1px solid var(--border);
+            padding: 24px 18px;
+            box-shadow: 2px 0 8px rgba(0,0,0,0.04);
+        }
+
+        .sidebar h2 { font-size: 1.3em; color: var(--primary); margin-top: 0; margin-bottom: 12px; border-bottom: 2px solid var(--primary); padding-bottom: 6px; }
+        .sidebar ul { list-style: none; padding: 0; margin-bottom: 20px; }
+        .sidebar li { margin-bottom: 4px; }
+        .sidebar a {
+            text-decoration: none;
+            color: var(--text-main);
+            font-size: 0.9em;
+            display: block;
+            padding: 5px 8px;
+            border-radius: 4px;
+            transition: all 0.15s ease-in-out;
+        }
+        .sidebar a:hover { background-color: #e1e4e8; color: var(--primary-dark); font-weight: 600;}
+
+        /* Main Content */
+        .content {
+            margin-left: 340px;
+            padding: 40px 60px;
+            max-width: 1200px;
+            width: calc(100% - 340px);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            color: var(--text-main);
+        }
+
+        h1 { font-size: 2.6em; border-bottom: 3px solid #eaecef; padding-bottom: 12px; margin-top: 0; color: #1a1a1a; font-family: inherit; }
+        h2 { font-size: 1.9em; color: var(--primary); margin-top: 50px; border-bottom: 2px solid #eaecef; padding-bottom: 8px; font-family: inherit; }
+        h3 { font-size: 1.4em; color: #24292e; margin-top: 32px; padding-top: 10px; font-family: inherit; }
+        h4 { font-size: 1.15em; color: var(--accent); margin-top: 20px; font-family: inherit; }
+
+        p, li {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            font-size: 16px;
+            line-height: 1.7;
+            color: var(--text-main);
+        }
+
+        p { margin-bottom: 16px; }
+        ul, ol { margin-bottom: 18px; padding-left: 24px; }
+        li { margin-bottom: 6px; }
+
+        /* Code Blocks */
+        pre {
+            background-color: var(--code-bg);
+            color: var(--code-color);
+            padding: 18px 22px;
+            border-radius: 8px;
+            overflow-x: auto;
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+            font-size: 0.88em;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            line-height: 1.55;
+        }
+        code {
+            background-color: rgba(27,31,35,0.06);
+            padding: 0.2em 0.4em;
+            border-radius: 4px;
+            font-family: "SFMono-Regular", Consolas, monospace;
+            color: #c7254e;
+            font-size: 0.9em;
+        }
+        pre code { background-color: transparent; color: inherit; padding: 0; font-size: 1em; }
+
+        /* Callouts */
+        .callout {
+            padding: 18px 22px;
+            margin: 22px 0;
+            border-left: 5px solid var(--primary);
+            border-radius: 6px;
+            background-color: #f0f7ff;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.04);
+        }
+        .callout.warning { background-color: #fff9e6; border-color: var(--accent); }
+        .callout.important { background-color: #e6fffa; border-color: #00b5ad; }
+        .callout h4 { margin-top: 0; margin-bottom: 8px; color: inherit; }
+
+        /* Diagrams & Tables */
+        .mermaid {
+            background: white;
+            padding: 20px;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            text-align: center;
+            margin: 25px 0;
+            box-shadow: 0 3px 8px rgba(0,0,0,0.04);
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 22px 0;
+            font-size: 0.95em;
+        }
+        th, td {
+            border: 1px solid var(--border);
+            padding: 10px 14px;
+            text-align: left;
+        }
+        th { background-color: #f6f8fa; font-weight: 600; }
+        tr:nth-child(even) { background-color: #fcfcfc; }
+    </style>
+</head>
+<body>
+
+    <nav class="sidebar">
+        <h2>BlueROV2 Master Wiki</h2>
+        
+        <ul>
+            <li><strong>1. System Architecture</strong></li>
+            <li><a href="#sys-overview">1.1 Overview & Topology</a></li>
+            <li><a href="#sys-nodes">1.2 Physical & Logical Nodes</a></li>
+        </ul>
+
+        <ul>
+            <li><strong>2. Hardware & Drivers</strong></li>
+            <li><a href="#hw-pca">2.1 PCA9685 PWM & ESCs</a></li>
+            <li><a href="#hw-ms5837">2.2 MS5837 Pressure & Depth</a></li>
+            <li><a href="#hw-icm">2.3 ICM20602 IMU & Gyro</a></li>
+        </ul>
+        
+        <ul>
+            <li><strong>3. Networking Protocols</strong></li>
+            <li><a href="#net-udp">3.1 UDP Binary Struct Payload</a></li>
+            <li><a href="#net-video">3.2 Video Chunking & Framing</a></li>
+            <li><a href="#net-telemetry">3.3 Telemetry Stream Protocol</a></li>
+            <li><a href="#net-watchdog">3.4 Failsafe Watchdogs & Threads</a></li>
+        </ul>
+
+        <ul>
+            <li><strong>4. Kinematics & Control</strong></li>
+            <li><a href="#ctrl-mix">4.1 Thruster Mixing Matrix</a></li>
+            <li><a href="#ctrl-sat">4.2 Actuator Saturation Coupling</a></li>
+            <li><a href="#ctrl-pi">4.3 Depth PI Closed-Loop Control</a></li>
+            <li><a href="#ctrl-yaw">4.4 Circular Yaw Angle Math</a></li>
+        </ul>
+
+        <ul>
+            <li><strong>5. Topside Client</strong></li>
+            <li><a href="#top-loop">5.1 Pygame 30Hz Event Loop</a></li>
+            <li><a href="#top-mp">5.2 Multiprocessing (GIL Bypass)</a></li>
+            <li><a href="#top-mcap">5.3 Asynchronous MCAP Logging</a></li>
+        </ul>
+
+        <ul>
+            <li><strong>6. Computer Vision</strong></li>
+            <li><a href="#vis-yolo">6.1 YOLO Fine-Tuning Pipeline</a></li>
+            <li><a href="#vis-diag">6.2 Visual Latency Diagnostics</a></li>
+            <li><a href="#vis-tag">6.3 AprilTag Tracking & Mission</a></li>
+        </ul>
+
+        <ul>
+            <li><strong>7. Autonomy Strategy FSM</strong></li>
+            <li><a href="#fsm-bbox">7.1 BoundingBox Upward Bias</a></li>
+            <li><a href="#fsm-states">7.2 FSM State Transitions</a></li>
+            <li><a href="#fsm-antistall">7.3 Anti-Stall Dash & Reset</a></li>
+            <li><a href="#fsm-gains">7.4 Hot-Reloadable JSON Gains</a></li>
+        </ul>
+
+        <ul>
+            <li><strong>8. Unity Simulator (C#)</strong></li>
+            <li><a href="#sim-hydro">8.1 Hydrodynamics.cs Engine</a></li>
+            <li><a href="#sim-bridge">8.2 SimBridge.cs UDP Layer</a></li>
+            <li><a href="#sim-mix">8.3 ThrusterMixer.cs Parity</a></li>
+            <li><a href="#sim-tuning">8.4 TuningHarness.cs Solvers</a></li>
+            <li><a href="#sim-spawn">8.5 RandomSpawn.cs Logic</a></li>
+        </ul>
+
+        <ul>
+            <li><strong>9. Simulator Python Runners</strong></li>
+            <li><a href="#run-sim">9.1 run_sim.py Main Runner</a></li>
+            <li><a href="#run-evade">9.2 run_evade.py Target Runner</a></li>
+        </ul>
+
+        <ul>
+            <li><strong>10. Runbook & Handoff</strong></li>
+            <li><a href="#run-net">10.1 Network Configuration</a></li>
+            <li><a href="#run-ops">10.2 Daily Deployment Checklist</a></li>
+            <li><a href="#run-bench">10.3 Bench Diagnostics</a></li>
+        </ul>
+    </nav>
+
+    <main class="content">
+        <h1>BlueROV2 Master Technical Handoff Wiki</h1>
+        <p>This master technical wiki provides an exhaustive end-to-end breakdown of the custom BlueROV2 software stack, electronics, physics simulation, kinematics, network protocols, computer vision pipeline, finite state machine autonomy, and fidelity tuning workflows.</p>
+
+        <!-- ==========================================
+             MODULE 1: ARCHITECTURE
+        =========================================== -->
+        <h2 id="sys-arch">1. System Architecture Overview</h2>
+        
+        <h3 id="sys-overview">1.1 Overview & Purpose</h3>
+        <p>The core objective of this codebase is to maintain a <strong>matched pair</strong> of systems for a custom 6-DOF BlueROV2 (r1) submarine:</p>
+        <ol>
+            <li>A high-fidelity physics simulator built in Unity (C#).</li>
+            <li>A physical submarine hardware stack powered by a Raspberry Pi running <code>rov_server.py</code>.</li>
+        </ol>
+        <p>Both systems accept the exact same 4-DOF motion commands (Surge, Strafe, Heave, Yaw), pass through an identical 6-thruster mixing matrix, and communicate over identical binary UDP socket structures. Control policies, vision state machines, and reinforcement learning models developed in simulation drop onto physical hardware with zero code modifications.</p>
+
+        <h3 id="sys-nodes">1.2 Physical & Logical Nodes</h3>
+        <div class="mermaid">
+        graph TD
+            subgraph Topside Ground Station
+                UI[Pygame Interface] --> Gamepad[Xbox Controller]
+                UI --> Slider[Tune Slider Panel]
+                Slider --> GainsJSON[strategy_gains.json]
+                
+                Process[multiprocessing.Process] -->|Queue IPC| YOLO[YOLO Inference Engine]
+                VideoRx[Video Receiver Thread] --> Process
+                
+                Brain[Strategy Brain FSM] -->|Surge, Strafe, Heave, Yaw| Mix[Thruster Mixer]
+                YOLO -->|BoundingBox| Brain
+                GainsJSON -->|Hot-Reload| Brain
+                Gamepad -->|Manual Override| Mix
+            end
+
+            subgraph UDP Network Protocol Layer
+                Mix -->|struct.pack 14 Bytes| MotorPort[Port 60000 / 60011]
+                VideoPort[Port 60002 / 60010] -->|JPEG Chunks / struct.pack 16 Bytes| VideoRx
+                SensorPort[Port 60001] -->|struct.pack 20 Bytes| UI
+            end
+
+            subgraph Submarine Pi / Unity Simulator
+                MotorPort --> Server[rov_server.py / SimBridge.cs]
+                Server --> PCA[PCA9685 I2C Hardware / Rigidbody Force]
+                Camera[PiCam / Unity Cam] --> VideoPort
+                Sensors[MS5837 Depth & ICM20602 IMU] --> SensorPort
+            end
+        </div>
+
+        <!-- ==========================================
+             MODULE 2: HARDWARE
+        =========================================== -->
+        <h2 id="hw-drivers">2. Submarine Hardware & Low-Level Drivers</h2>
+
+        <h3 id="hw-pca">2.1 PCA9685 PWM Generation & ESC Control (<code>pca9685.py</code>)</h3>
+        <p>The Raspberry Pi running <code>rov_server.py</code> delegates hardware PWM pulse generation to an NXP <strong>PCA9685</strong> 16-channel 12-bit controller over I2C (Bus 1).</p>
+        
+        <h4>PWM Pulse Calculation</h4>
+        <p>Electronic Speed Controllers (ESCs) expect a 50 Hz control signal ($T = 20\text{ ms} = 20,000\ \mu\text{s}$). The 12-bit PCA9685 resolution divides this period into 4096 ticks (0 to 4095). Microsecond pulse widths map to register tick counts via:</p>
+        $$\text{Ticks} = \text{round}\left( 4095 \times \frac{\text{PWM}_{\mu\text{s}}}{20000\ \mu\text{s}} \right)$$
+
+        <h4>Sleep Mode & Prescaler Registers</h4>
+        <p>To establish 50 Hz, the internal 25 MHz oscillator is scaled by a prescaler register:</p>
+        $$\text{Prescaler} = \text{round}\left( \frac{25\text{ MHz}}{4096 \times 50\text{ Hz}} \right) - 1 = 121 \quad (0x79)$$
+        <p>Per NXP specification, prescaler registers can <em>only</em> be written while the chip's sleep bit (Bit 4 of <code>MODE1</code>) is set. The driver executes:</p>
+        <pre><code># 1. Force PCA9685 into sleep mode
+self.write(REG_MODE1, [MODE1_EXTCLK | MODE1_SLEEP | MODE1_AI])
+# 2. Write calculated prescaler (121)
+self.write(REG_PRESCALE, [prescaler & 0xFF])
+# 3. Clear sleep bit to resume operation
+self.write(REG_MODE1, [MODE1_EXTCLK | MODE1_AI])</code></pre>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Channel</th>
+                    <th>Function</th>
+                    <th>Signal Range ($\mu$s)</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr><td>0</td><td>Front-Left Horizontal Thruster (FL)</td><td>1100 - 1900</td></tr>
+                <tr><td>1</td><td>Front-Right Horizontal Thruster (FR)</td><td>1100 - 1900</td></tr>
+                <tr><td>2</td><td>Rear-Left Horizontal Thruster (RL)</td><td>1100 - 1900</td></tr>
+                <tr><td>3</td><td>Rear-Right Horizontal Thruster (RR)</td><td>1100 - 1900</td></tr>
+                <tr><td>4</td><td>Vertical Thruster 1 (V1)</td><td>1100 - 1900</td></tr>
+                <tr><td>5</td><td>Vertical Thruster 2 (V2)</td><td>1100 - 1900</td></tr>
+                <tr><td>9</td><td>Submarine LED Light</td><td>1100 (OFF) - 1900 (ON)</td></tr>
+                <tr><td>15</td><td>Camera Tilt Servo</td><td>Custom pulse (aiming)</td></tr>
+            </tbody>
+        </table>
+
+        <h3 id="hw-ms5837">2.2 MS5837 Depth & Pressure Sensor (<code>ms5837.py</code>)</h3>
+        <p>The <strong>MS5837-30BA</strong> sensor measures piezoresistive absolute pressure via I2C (Bus 6). At boot, factory PROM calibration coefficients ($C_1 \dots C_6$) are read and validated using a 4-bit CRC check.</p>
+
+        <h4>Second-Order Temperature Compensation</h4>
+        <p>Because thermal expansion skews silicon piezoresistance underwater, second-order polynomial corrections compensate for temperatures below $20^\circ\text{C}$:</p>
+        <pre><code>dT = D2 - C5 * 256
+T = 2000 + (dT * C6) / 8388608
+
+if T < 2000: # Below 20°C
+    Ti = (11 * dT * dT) / 34359738368
+    OFFi = (31 * (T - 2000) * (T - 2000)) / 8
+    SENSi = (63 * (T - 2000) * (T - 2000)) / 32</code></pre>
+        <p>Hydrostatic depth ($d$) is calculated using fluid density $\rho$ ($997\text{ kg/m}^3$ freshwater vs $1029\text{ kg/m}^3$ saltwater):</p>
+        $$\text{Depth (m)} = \frac{(P_{\text{pascals}} - P_{\text{surface}})}{\rho \cdot g}$$
+
+        <h3 id="hw-icm">2.3 ICM20602 Gyroscope & Accelerometer (<code>icm20602.py</code>)</h3>
+        <p>The <strong>ICM20602</strong> IMU communicates over SPI (Bus 1, CS 2) at 10 MHz. SPI bitwise reads enforce high MSB (<code>reg | 0x80</code>).</p>
+        
+        <div class="callout warning">
+            <h4>Why Gyro Z-Integration over Compass Magnetometers?</h4>
+            <p>High thruster current draws (up to 60+ Amperes) generate massive localized electromagnetic fields ($\vec{B} \propto I$) that distort magnetic compasses. Heading is instead computed by integrating bias-corrected gyro Z-rate ($\omega_z$).</p>
+        </div>
+
+        <p>At startup, 60 stationary samples calculate the resting gyro bias $\beta_z$, preventing stationary drift:</p>
+        $$\text{Heading}(t) = \text{Heading}(t - \Delta t) + (\omega_z - \beta_z) \Delta t$$
+
+        <!-- ==========================================
+             MODULE 3: NETWORKING
+        =========================================== -->
+        <h2 id="net-protocols">3. Networking Protocols & Communications Layer</h2>
+
+        <h3 id="net-udp">3.1 UDP Binary Struct Payload (<code>&lt;7H&gt;</code>)</h3>
+        <p>Thruster packets transmit over UDP port <code>60000</code> (or <code>60011</code> in simulation) using Python's binary <code>struct</code> library. Format string <code>"&lt;7H"</code> packs 7 unsigned 16-bit integers into exactly 14 bytes:</p>
+        <ul>
+            <li><code>&lt;</code>: Little-endian ordering (ARM / x86 architecture parity).</li>
+            <li><code>7H</code>: 7 $\times$ 2-byte unsigned short integers (Channels 0-5 thrusters + Channel 9 light).</li>
+        </ul>
+        <pre><code># Client / Sim Runner Side: Pack commands (1100 to 1900 us)
+packet = struct.pack("<7H", fl_pwm, fr_pwm, rl_pwm, rr_pwm, v1_pwm, v2_pwm, light_pwm)
+
+# Server / Unity SimBridge Side: Unpack 14 bytes instantly
+fl, fr, rl, rr, v1, v2, light = struct.unpack("<7H", data)</code></pre>
+
+        <h3 id="net-video">3.2 Video Streaming Chunking & Frame Reassembly (<code>!HHH</code>)</h3>
+        <p>JPEG encoded video frames often exceed the 1,500-byte MTU limit. <code>rov_server.py</code> slices JPEG byte arrays into 60,000-byte chunks prepended with a 6-byte header formatted in network Big-Endian (<code>!HHH</code>): Frame ID, Total Blocks, Block Index.</p>
+        <pre><code>header = struct.pack("!HHH", fid & 0xFFFF, blocks, idx)
+sock.sendto(header + chunk_payload, (client_ip, port))</code></pre>
+        <p>Topside client maintains an asynchronous frame buffer, decoding complete byte arrays via <code>cv2.imdecode</code>.</p>
+
+        <h3 id="net-telemetry">3.3 Telemetry Stream Protocol (<code>&lt;dff&gt;</code>)</h3>
+        <p>Depth and heading stream topside over UDP port <code>60001</code> at 50 Hz.</p>
+        <ul>
+            <li>Format string: <code>"&lt;dff"</code> (20 bytes total).</li>
+            <li><code>d</code>: Double-precision float64 (Unix epoch timestamp).</li>
+            <li><code>f</code>: Single-precision float32 (Water depth in meters).</li>
+            <li><code>f</code>: Single-precision float32 (Integrated yaw heading in degrees).</li>
+        </ul>
+
+        <h3 id="net-watchdog">3.4 Failsafe Watchdogs & Threading Architecture</h3>
+        <p>The server runs three independent Python threads (<code>thruster_loop</code>, <code>video_loop</code>, <code>sensor_loop</code>). If networking drops for $>0.5\text{ s}$, <code>thruster_loop</code> forces all motor channels to <code>1500</code> ($\text{Neutral}$), preventing thruster runaway. Unity's <code>SimBridge.cs</code> enforces the exact same 0.5s timeout.</p>
+
+        <!-- ==========================================
+             MODULE 4: KINEMATICS
+        =========================================== -->
+        <h2 id="ctrl-theory">4. Kinematics, Thruster Mixing & Closed-Loop Control</h2>
+
+        <h3 id="ctrl-mix">4.1 Vectored Thruster Mixing Matrix</h3>
+        <p>The BlueROV2 horizontal thrusters are angled at $45^\circ$. Commands $\in [-1.0, 1.0]$ map to thruster pulse outputs via:</p>
+        <pre><code>def mix(surge, strafe, heave, yaw):
+    fl = clamp(surge - strafe - yaw)
+    fr = clamp(surge + strafe + yaw)
+    rl = clamp(surge + strafe - yaw)
+    rr = clamp(surge - strafe + yaw)
+    v1 = clamp(heave)
+    v2 = clamp(-heave)
+    return fl, fr, rl, rr, v1, v2</code></pre>
+
+        <h3 id="ctrl-sat">4.2 Actuator Saturation & Axis Coupling</h3>
+        <p>If an operator commands full forward ($\text{surge} = 1.0$) and full turn ($\text{yaw} = 1.0$), the unclipped sum for Front-Right is $1.0 + 1.0 = 2.0$. Hard `clamp(-1.0, 1.0)` clips this to $1.0$. Saturation causes axis coupling, which `ThrusterMixer.cs` reproduces in simulation.</p>
+
+        <h3 id="ctrl-pi">4.3 Closed-Loop Depth PI Control</h3>
+        <p>Depth holding uses Proportional-Integral feedback with anti-windup clamping to fight positive net buoyancy:</p>
+        <pre><code>err = current_depth - hold_target
+p_term = HOLD_KP * err
+
+if abs(err) >= 0.02: # 2 cm deadband
+    self._hold_i += err * dt
+    self._hold_i = max(-i_cap, min(i_cap, self._hold_i))
+
+i_term = HOLD_KI * self._hold_i
+cmd = clamp(p_term + i_term)</code></pre>
+
+        <h3 id="ctrl-yaw">4.4 Circular Yaw Angle Math</h3>
+        <p>Angular errors wrap along the shortest arc on $S^1$ within $[-180^\circ, 180^\circ)$:</p>
+        <pre><code>def _yaw_error(target_deg: float, current_deg: float) -> float:
+    return (target_deg - current_deg + 180.0) % 360.0 - 180.0</code></pre>
+
+        <!-- ==========================================
+             MODULE 5: TOPSIDE ARCHITECTURE
+        =========================================== -->
+        <h2 id="top-arch">5. Topside Software Architecture (<code>rov_client.py</code>)</h2>
+
+        <h3 id="top-loop">5.1 Pygame 30Hz Event Loop & Modes</h3>
+        <p>Main topside client executes a synchronous 30 Hz event loop (`clock.tick(30)`). Modes include Manual Gamepad Control, Autonomous Strategy Brain, AprilTag Mission Tracking, and Thruster Step Test Panel.</p>
+
+        <h3 id="top-mp">5.2 Multiprocessing Strategy (GIL Bypass)</h3>
+        <p>To avoid Pygame UI frame drops caused by Python's Global Interpreter Lock (GIL), YOLO neural network inference executes in an isolated process space using <code>multiprocessing.get_context("spawn")</code>. Shared memory queues (`yolo_in`, `yolo_out`) with `maxsize=1` exchange frame bounding boxes asynchronously.</p>
+        <pre><code>ctx = mp.get_context("spawn")
+self.yolo_in = ctx.Queue(maxsize=1)
+self.yolo_out = ctx.Queue(maxsize=1)
+
+self.yolo_proc = ctx.Process(
+    target=_yolo_worker,
+    args=(weights, conf, self.yolo_in, self.yolo_out, stop_event),
+    daemon=True
+)</code></pre>
+
+        <h3 id="top-mcap">5.3 Asynchronous MCAP Data Logging</h3>
+        <p>Telemetry ticks and vision detections log to Foxglove `.mcap` files protected by a mutual exclusion thread lock (`threading.Lock`), flushing buffers to disk every 1.0 second.</p>
+
+        <!-- ==========================================
+             MODULE 6: VISION
+        =========================================== -->
+        <h2 id="vis-pipeline">6. Computer Vision & Dataset Tooling (YOLO & AprilTag)</h2>
+
+        <h3 id="vis-yolo">6.1 YOLO Fine-Tuning Pipeline (<code>train.py</code>)</h3>
+        <p><code>train.py</code> fine-tunes YOLO26n / YOLOv8 models on Roboflow datasets with automatic CUDA / Apple MPS GPU hardware acceleration. Weights land at <code>runs/detect/&lt;name&gt;/weights/best.pt</code>.</p>
+
+        <h3 id="vis-diag">6.2 Frame Extraction & Latency Diagnostics</h3>
+        <p><code>render.py</code> performs off-sub model benchmarking overlaying FPS and inference latency. <code>extract_frames.py</code> extracts training samples from recorded MP4 flight logs.</p>
+
+        <h3 id="vis-tag">6.3 AprilTag Target Detection & Mission Control</h3>
+        <p>Uses Pupil AprilTags / OpenCV ArUco detector to track unique tag IDs, triggering LED pulses upon reaching target mission tag counts.</p>
+
+        <!-- ==========================================
+             MODULE 7: AUTONOMY FSM
+        =========================================== -->
+        <h2 id="fsm-brain">7. Autonomy Strategy Brain & Finite State Machine</h2>
+
+        <h3 id="fsm-bbox">7.1 BoundingBox Upward Bias</h3>
+        <p>Target framing aims at the top edge of the bounding box rather than center, inducing upward thrust bias that keeps the sub elevated off the pool floor:</p>
+        <pre><code>@property
+def center(self) -> Tuple[float, float]:
+    return (self.x + self.width / 2, self.y) # top edge y induces upward bias</code></pre>
+
+        <h3 id="fsm-states">7.2 FSM State Transitions</h3>
+        <div class="mermaid">
+        stateDiagram-v2
+            [*] --> IDLE
+            IDLE --> SEARCHING : Enable Autonomy
+            SEARCHING --> ADVANCING : Target Detected
+            ADVANCING --> ORBITING : Box Area > 5% Frame
+            ORBITING --> SCANNING : AprilTag Back Visible
+            ORBITING --> RESET : Orbit Lock > 20s
+            SCANNING --> ORBITING : AprilTag Lost
+            RESET --> SEARCHING : Maneuver Done
+        </div>
+
+        <h3 id="fsm-antistall">7.3 Anti-Stall Dash & Reset Maneuvers</h3>
+        <ul>
+            <li><strong>Post-Flip DASH:</strong> Reversing orbit direction triggers a 1.5s dash at 100% strafe to break geometry locks.</li>
+            <li><strong>3-Stage RESET Maneuver:</strong> If stalemated for 20s, executes: Heave UP/DOWN, Surge FORWARD, Yaw 180°.</li>
+        </ul>
+
+        <h3 id="fsm-gains">7.4 Hot-Reloadable JSON Gains</h3>
+        <p>`Strategy` polls the OS file modification timestamp (`mtime`) of `strategy_gains.json` every cycle, reloading slider adjustments live without restarting.</p>
+
+        <!-- ==========================================
+             MODULE 8: UNITY SIMULATOR C#
+        =========================================== -->
+        <h2 id="sim-engine">8. Unity Simulator Architecture (C# Source Code)</h2>
+
+        <h3 id="sim-hydro">8.1 Hydrodynamics.cs Engine</h3>
+        <p>The <code>Hydrodynamics.cs</code> script implements the 6-DOF Fossen underwater hydrodynamics equations within Unity's <code>FixedUpdate()</code> loop:</p>
+
+        <h4>1. Restoring Forces (Weight & Buoyancy)</h4>
+        <pre><code>void ApplyRestoring() {
+    Vector3 cg = rb.worldCenterOfMass;
+    Vector3 cb = cg + transform.up * centreOfBuoyancyHeight;
+    rb.AddForceAtPosition(Vector3.down * weight, cg, ForceMode.Force);
+    rb.AddForceAtPosition(Vector3.up * buoyancy, cb, ForceMode.Force);
+}</code></pre>
+
+        <h4>2. Effective Mass Acceleration Scaling</h4>
+        <p>Because Unity's <code>Rigidbody</code> solver assumes a scalar mass $m_{\text{dry}}$, anisotropic added mass $\mathbf{m}_a$ is simulated by scaling applied body forces so acceleration matches $a_i = F_i / (m_{\text{dry}} + m_{a,i})$:</p>
+        $$F_{i,\text{applied}} = f_i \cdot \frac{m_{\text{dry}}}{m_{\text{dry}} + m_{a,i}}$$
+
+        <h4>3. Added-Mass Coriolis & Centripetal Coupling</h4>
+        <p>When translating and rotating simultaneously, linear added mass generates coupling forces and torques:</p>
+        <pre><code>void ApplyCoriolis() {
+    if (!enableCoriolis) return;
+    Vector3 v = transform.InverseTransformDirection(rb.linearVelocity);
+    Vector3 w = transform.InverseTransformDirection(rb.angularVelocity);
+    Vector3 a1 = Vector3.Scale(addedMassLinear, v); // Linear added momentum
+
+    Vector3 fCor = -Vector3.Cross(w, a1);
+    fCor.x *= rb.mass / (rb.mass + addedMassLinear.x);
+    fCor.y *= rb.mass / (rb.mass + addedMassLinear.y);
+    fCor.z *= rb.mass / (rb.mass + addedMassLinear.z);
+    rb.AddForce(transform.TransformDirection(fCor), ForceMode.Force);
+
+    Vector3 tCor = -Vector3.Cross(v, a1);
+    rb.AddRelativeTorque(tCor, ForceMode.Force);
+}</code></pre>
+
+        <h3 id="sim-bridge">8.2 SimBridge.cs UDP Layer</h3>
+        <p><code>SimBridge.cs</code> acts as the network port-mirror layer. It receives thruster UDP packets (<code>&lt;7H&gt;</code>) on port <code>60011</code>, inverts the thruster mix to recover surge/strafe/heave/yaw, and projects the target sub into 640x480 screen coordinates to stream 16-byte UDP bounding boxes (<code>&lt;4f&gt;</code>) on port <code>60010</code>.</p>
+
+        <h3 id="sim-mix">8.3 ThrusterMixer.cs Parity</h3>
+        <p><code>ThrusterMixer.cs</code> provides a static C# struct and mixing method matching Python's mixing matrix 1:1:</p>
+        <pre><code>public static ThrusterOutput Mix(float surge, float strafe, float heave, float yaw) {
+    return new ThrusterOutput {
+        fl = Mathf.Clamp(surge - strafe - yaw, -1f, 1f),
+        fr = Mathf.Clamp(surge + strafe + yaw, -1f, 1f),
+        rl = Mathf.Clamp(surge + strafe - yaw, -1f, 1f),
+        rr = Mathf.Clamp(surge - strafe + yaw, -1f, 1f),
+        v1 = Mathf.Clamp(heave, -1f, 1f),
+        v2 = Mathf.Clamp(-heave, -1f, 1f),
+    };
+}</code></pre>
+
+        <h3 id="sim-tuning">8.4 TuningHarness.cs Solvers</h3>
+        <p><code>TuningHarness.cs</code> contains an offline nested bisection solver (40 outer iterations for drag scale, 40 inner iterations for thrust gain) that calculates exact hydrodynamic gain adjustments from real pool pulse test measurements (powered distance + coasting glide).</p>
+
+        <h3 id="sim-spawn">8.5 RandomSpawn.cs Logic</h3>
+        <p><code>RandomSpawn.cs</code> teleports submarine GameObjects on Play start inside volume `areaCenter = (0, 1.5, 0)` and `areaSize = (13, 2, 13)`, applies random yaw rotation, zeros velocity, and synchronizes transforms.</p>
+
+        <!-- ==========================================
+             MODULE 9: RUNNERS
+        =========================================== -->
+        <h2 id="run-python">9. Simulator Python Runners</h2>
+
+        <h3 id="run-sim">9.1 run_sim.py Main Runner</h3>
+        <p><code>run_sim.py</code> connects <code>Strategy</code> to Unity at 50 Hz over UDP ports 60010/60011, draining socket queues to prevent latency build-up. Supports `--mock` mode for fake target trajectories.</p>
+
+        <h3 id="run-evade">9.2 run_evade.py Target Runner</h3>
+        <p><code>run_evade.py</code> binds <code>strategy_target.py</code> to target ports 60012/60013 for live 2-sub sparring matches in Unity.</p>
+
+        <!-- ==========================================
+             MODULE 10: RUNBOOK
+        =========================================== -->
+        <h2 id="runbook">10. Operator Runbook & Handoff Guide</h2>
+
+        <h3 id="run-net">10.1 Network Configuration</h3>
+        <pre><code># Raspberry Pi Static IP
+sudo nmcli connection add type ethernet ifname eth0 con-name eth0-static ipv4.addresses 192.168.2.10/24 ipv4.method manual
+sudo nmcli connection up eth0-static</code></pre>
+
+        <h3 id="run-ops">10.2 Daily Deployment Checklist</h3>
+        <pre><code># Real Sub Dive
+python3 server/rov-server.py
+python3 client/rov_client.py --weights best.pt --strategy new_strategy_full
+
+# Unity Match Simulation
+python3 run_sim.py
+python3 run_evade.py</code></pre>
+
+        <h3 id="run-bench">10.3 Bench Diagnostics</h3>
+        <pre><code># Light channel identifier
+python3 bench/light_finder.py
+
+# Camera servo alignment
+python3 bench/camera_aim.py
+
+# Gamepad test
+python3 bench/gamepad_test.py</code></pre>
+    </main>
+
+</body>
+</html>
