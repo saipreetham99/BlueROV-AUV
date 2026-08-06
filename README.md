@@ -392,4 +392,4 @@ idle keep-alive so the light and watchdog stay live even when no test is running
 and it neutralizes on quit. STOP aborts any test, autonomy run, or manual drive and
 sends neutral immediately. The bench tools hold the thrusters neutral and leave the
 camera servo untouched. When testing anywhere near the thrusters out of water, keep
-clear of the propellers.
+clear of the propellers(Or Find out the hard way)
